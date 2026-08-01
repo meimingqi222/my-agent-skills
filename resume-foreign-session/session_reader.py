@@ -1931,7 +1931,7 @@ def _discover_cursor_cli(cwd: str | None, within_min: int) -> list[dict[str, Any
                 continue
             metadata = _cursor_cli_metadata(child)
             stored_cwd = metadata.get("cwd")
-            if cwd is not None and stored_cwd and os.path.normpath(stored_cwd) != os.path.normpath(cwd):
+            if cwd is not None and stored_cwd and not _paths_match(stored_cwd, cwd):
                 continue
             updated = int(metadata.get("updated_at_ms") or 0)
             if not _within(updated, within_min):
@@ -1992,10 +1992,7 @@ def _discover_cursor_desktop(cwd: str | None, within_min: int) -> list[dict[str,
                         "source_repo_root_path": None,
                     }
                     _merge_cursor_metadata(metadata, value)
-                    if cwd is not None and (
-                        not metadata.get("cwd")
-                        or os.path.normpath(metadata["cwd"]) != os.path.normpath(cwd)
-                    ):
+                    if cwd is not None and not _paths_match(metadata.get("cwd"), cwd):
                         continue
                     updated = int(metadata["updated_at_ms"])
                     if not _within(updated, within_min):
@@ -2405,7 +2402,7 @@ def _discover_claude(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
             except ReaderError:
                 continue
             if cwd is not None:
-                if result.get("cwd") and os.path.normpath(result["cwd"]) != os.path.normpath(cwd):
+                if result.get("cwd") and not _paths_match(result["cwd"], cwd):
                     continue
                 if not result.get("cwd") and project != expected:
                     continue
@@ -3015,6 +3012,11 @@ def resolve_session(
     if ref == "latest":
         if not sessions:
             sessions = discover_sessions(tool, None, within_min)
+            if sessions:
+                # The newest session lives under a different working directory.
+                # Flag it so the caller can warn instead of silently handing the
+                # agent a session from an unrelated project.
+                sessions[0] = {**sessions[0], "cwd_fallback": cwd}
         if not sessions:
             raise ReaderError(f"no {tool} session found for cwd {cwd}")
         return sessions[0]
@@ -3167,7 +3169,7 @@ def main(argv: list[str] | None = None) -> int:
                             "warnings": [],
                         },
                         indent=2,
-                        ensure_ascii=True,
+                        ensure_ascii=False,
                     )
                 )
             else:
@@ -3175,8 +3177,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         candidate = resolve_session(args.tool, args.ref, args.cwd, args.within_min)
         result = read_resolved_session(candidate, args.max_tool_chars)
+        requested_cwd = candidate.get("cwd_fallback")
+        if requested_cwd:
+            _add_warning(
+                result["warnings"],
+                "cwd_fallback",
+                f"No {args.tool} session exists for {requested_cwd}; this session belongs to a "
+                f"different working directory ({result.get('cwd') or 'unknown'}). Confirm it is the "
+                "project the user meant before acting on it.",
+            )
+            result["warnings"].sort(key=lambda item: (item["code"], item["message"]))
         if args.json:
-            print(json.dumps(result, indent=2, ensure_ascii=True))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
         else:
             print(render_human(result), end="")
         return 0
