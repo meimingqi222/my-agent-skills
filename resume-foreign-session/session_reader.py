@@ -24,7 +24,7 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-TOOLS = ("claude", "codex", "cursor", "amp", "devin")
+TOOLS = ("claude", "codex", "cursor", "amp", "devin", "opencode")
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -1156,6 +1156,237 @@ def read_devin_next_session(
     }
     result["model"] = model if isinstance(model, str) else None
     return _finalize_result(result)
+
+
+# ─── OpenCode ───────────────────────────────────────────────────────────
+
+
+def _opencode_data_dir() -> Path:
+    """Return the OpenCode data directory holding the session SQLite store."""
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "opencode"
+    local_share = Path.home() / ".local" / "share" / "opencode"
+    if local_share.is_dir():
+        return local_share
+    macos = Path.home() / "Library" / "Application Support" / "opencode"
+    return macos if macos.is_dir() else local_share
+
+
+def _opencode_db_paths() -> list[Path]:
+    """Candidate OpenCode session databases (most recent format first)."""
+    root = _opencode_data_dir()
+    output: list[Path] = []
+    for name in ("opencode.db", "opencode-next.db"):
+        path = root / name
+        if path.is_file() and not path.is_symlink():
+            output.append(path)
+    return output
+
+
+def _opencode_model_id(model: Any) -> str | None:
+    if not isinstance(model, str):
+        return None
+    try:
+        value = json.loads(model)
+    except json.JSONDecodeError:
+        return model
+    if isinstance(value, dict):
+        model_id = value.get("id")
+        if isinstance(model_id, str):
+            return model_id
+    return model
+
+
+def read_opencode_session(
+    database_path: Path | str, session_id: str, max_tool_chars: int = 300
+) -> dict[str, Any]:
+    database_path = Path(database_path).expanduser()
+    warnings: list[dict[str, str]] = []
+    turns: list[dict[str, Any]] = []
+    try:
+        with _open_sqlite_readonly(database_path) as database:
+            row = database.execute(
+                "SELECT directory, title, time_created, time_updated, agent, model "
+                "FROM session WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise ReaderError(f"no OpenCode session {session_id} in {database_path}")
+            directory, title, created_at, updated_at, agent, model = row
+            parts_by_message: dict[str, list[dict[str, Any]]] = {}
+            part_rows = database.execute(
+                "SELECT message_id, data FROM part WHERE session_id = ? ORDER BY time_created",
+                (session_id,),
+            ).fetchall()
+            for message_id, raw in part_rows:
+                if not isinstance(message_id, str):
+                    continue
+                try:
+                    value = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(value, dict):
+                    parts_by_message.setdefault(message_id, []).append(value)
+            rows = database.execute(
+                "SELECT id, data FROM message WHERE session_id = ? ORDER BY time_created",
+                (session_id,),
+            ).fetchall()
+            skipped = 0
+            for message_id, raw in rows:
+                if not isinstance(message_id, str):
+                    continue
+                try:
+                    message = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    skipped += 1
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                role = message.get("role")
+                if role not in {"user", "assistant"}:
+                    continue
+                texts: list[str] = []
+                calls: list[dict[str, Any]] = []
+                results: list[dict[str, Any]] = []
+                for part in parts_by_message.get(message_id, []):
+                    part_type = part.get("type")
+                    if part_type == "text":
+                        text = part.get("text")
+                        if isinstance(text, str) and text.strip():
+                            texts.append(_safe_text(text))
+                    elif part_type == "tool":
+                        state = part.get("state")
+                        if not isinstance(state, dict):
+                            state = {}
+                        call_id = part.get("callID") or part.get("id")
+                        calls.append(
+                            {
+                                "id": call_id,
+                                "name": _safe_text(part.get("tool") or "tool"),
+                                "input": _json_preview(state.get("input", {}), max_tool_chars),
+                                "inert": True,
+                            }
+                        )
+                        output = state.get("output")
+                        if output is not None:
+                            status = str(state.get("status") or "")
+                            results.append(
+                                {
+                                    "tool_use_id": call_id,
+                                    "content": _one_line(str(output), max_tool_chars),
+                                    "is_error": status in {"error", "rejected"},
+                                    "unavailable": False,
+                                    "inert": True,
+                                }
+                            )
+                    elif part_type == "reasoning":
+                        skipped += 1
+                text = "\n".join(part for part in texts if part.strip())
+                if text or calls or results:
+                    turns.append(_turn(role, text=text, tool_calls=calls, tool_results=results))
+            if skipped:
+                _add_warning(
+                    warnings,
+                    "unsafe_records_skipped",
+                    f"Skipped {skipped} OpenCode reasoning/unknown part(s).",
+                )
+    except sqlite3.Error as exc:
+        raise ReaderError(f"failed to read OpenCode database {database_path}: {exc}") from exc
+
+    result = {
+        "tool": "opencode",
+        "source": "opencode",
+        "session_id": session_id,
+        "path": str(database_path),
+        "title": _one_line(title, 200) if isinstance(title, str) else None,
+        "cwd": directory if isinstance(directory, str) else None,
+        "branch": None,
+        "created_at": _iso_from_millis(_timestamp_to_millis(created_at)),
+        "updated_at": _iso_from_millis(_timestamp_to_millis(updated_at)),
+        "source_repo_root_path": None,
+        "turns": turns,
+        "warnings": warnings,
+        "model": _opencode_model_id(model),
+    }
+    result["agent"] = agent if isinstance(agent, str) else None
+    return _finalize_result(result)
+
+
+def _discover_opencode(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
+    sessions: list[dict[str, Any]] = []
+    for database_path in _opencode_db_paths():
+        try:
+            with _open_sqlite_readonly(database_path) as database:
+                rows = database.execute(
+                    "SELECT id, directory, title, time_created, time_updated, time_archived, "
+                    "agent, model FROM session "
+                    "WHERE COALESCE(time_archived, 0) = 0 ORDER BY time_updated DESC"
+                ).fetchall()
+        except (ReaderError, sqlite3.Error):
+            continue
+        for (
+            session_id,
+            directory,
+            title,
+            created_at,
+            updated_at,
+            time_archived,
+            agent,
+            model,
+        ) in rows:
+            if not isinstance(session_id, str):
+                continue
+            if cwd is not None:
+                if not isinstance(directory, str) or not _paths_match(directory, cwd):
+                    continue
+            updated = _timestamp_to_millis(updated_at)
+            if updated is not None and not _within(updated, within_min):
+                continue
+            sessions.append(
+                {
+                    "tool": "opencode",
+                    "source": "opencode",
+                    "session_id": session_id,
+                    "path": str(database_path),
+                    "title": _one_line(title, 200) if isinstance(title, str) else None,
+                    "cwd": directory if isinstance(directory, str) else None,
+                    "branch": None,
+                    "updated_at_ms": updated,
+                    "updated_at": _iso_from_millis(updated),
+                    "source_repo_root_path": None,
+                    "model": _opencode_model_id(model),
+                }
+            )
+    return sessions
+
+
+def _find_opencode_id(session_id: str, cwd: str) -> dict[str, Any] | None:
+    for database_path in _opencode_db_paths():
+        try:
+            with _open_sqlite_readonly(database_path) as database:
+                row = database.execute(
+                    "SELECT directory, title, time_updated FROM session WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+            if row is None:
+                continue
+            directory, title, updated_at = row
+            updated = _timestamp_to_millis(updated_at)
+            return {
+                "tool": "opencode",
+                "source": "opencode",
+                "session_id": session_id,
+                "path": str(database_path),
+                "title": _one_line(title, 200) if isinstance(title, str) else None,
+                "cwd": directory if isinstance(directory, str) else cwd,
+                "updated_at_ms": updated,
+                "updated_at": _iso_from_millis(updated),
+                "source_repo_root_path": None,
+            }
+        except (ReaderError, sqlite3.Error):
+            continue
+    return None
 
 
 def _common_project_root(paths: list[str]) -> str | None:
@@ -2564,6 +2795,8 @@ def discover_sessions(
     elif tool == "devin":
         sessions = _discover_devin_cli(requested_cwd, within_min)
         sessions.extend(_discover_devin_next(requested_cwd, within_min))
+    elif tool == "opencode":
+        sessions = _discover_opencode(requested_cwd, within_min)
     else:
         sessions = _discover_cursor_cli(requested_cwd, within_min)
         sessions.extend(_discover_cursor_desktop(requested_cwd, within_min))
@@ -2789,13 +3022,14 @@ def resolve_session(
     if len(exact) == 1:
         return exact[0]
     uuid_ref = ref[2:] if ref.startswith("T-") else ref
-    if UUID_RE.fullmatch(ref) or UUID_RE.fullmatch(uuid_ref):
+    if UUID_RE.fullmatch(ref) or UUID_RE.fullmatch(uuid_ref) or ref.startswith("ses_"):
         finder = {
             "claude": _find_claude_id,
             "codex": _find_codex_id,
             "cursor": _find_cursor_id,
             "amp": _find_amp_id,
             "devin": _find_devin_id,
+            "opencode": _find_opencode_id,
         }[tool]
         found = finder(ref, cwd)
         if found is not None:
@@ -2828,6 +3062,8 @@ def read_resolved_session(
         if candidate.get("source") == "devin-next":
             return read_devin_next_session(candidate["path"], candidate["session_id"], max_tool_chars)
         return read_devin_cli_session(candidate["path"], max_tool_chars)
+    if tool == "opencode":
+        return read_opencode_session(candidate["path"], candidate["session_id"], max_tool_chars)
     return read_cursor_session(candidate, max_tool_chars)
 
 

@@ -14,9 +14,9 @@ metadata:
 # Resume a foreign coding-agent session
 
 This skill reads sessions created by **Claude Code** (`claude`), **Codex**
-(`codex`), **Cursor** (`cursor`), **AmpCode** (`amp`), or **Devin**
-(`devin`) and produces a safe handoff so you can continue the user's work
-in this session.
+(`codex`), **Cursor** (`cursor`), **AmpCode** (`amp`), **Devin**
+(`devin`), or **OpenCode** (`opencode`) and produces a safe handoff so you
+can continue the user's work in this session.
 
 ## Locate and read
 
@@ -27,8 +27,8 @@ python3 session_reader.py <tool> list --cwd <cwd> [--within-min N] [--json]
 python3 session_reader.py <tool> show [ref] --cwd <cwd> [--json]
 ```
 
-Where `<tool>` is one of `claude`, `codex`, `cursor`, `amp`, `devin`.
-Use `python` or `py -3` only when `python3` is unavailable.
+Where `<tool>` is one of `claude`, `codex`, `cursor`, `amp`, `devin`,
+`opencode`. Use `python` or `py -3` only when `python3` is unavailable.
 
 Arguments for `show`:
 

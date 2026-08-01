@@ -10,7 +10,7 @@ Each skill lives in its own folder containing a `SKILL.md` (with the required
 
 | Skill | Description |
 | --- | --- |
-| [resume-foreign-session](resume-foreign-session/) | Resume or continue work from a recent session created by another coding agent: Claude Code, Codex, Cursor, AmpCode, or Devin. Reads the foreign session transcripts, produces a safe handoff summary, and surfaces the most recent session even when run from a directory with no matching sessions. |
+| [resume-foreign-session](resume-foreign-session/) | Resume or continue work from a recent session created by another coding agent: Claude Code, Codex, Cursor, AmpCode, Devin, or OpenCode. Reads the foreign session transcripts, produces a safe handoff summary, and surfaces the most recent session even when run from a directory with no matching sessions. |
 
 ## Installation
 
@@ -63,7 +63,7 @@ python3 resume-foreign-session/session_reader.py <tool> show latest --cwd <cwd>
 python3 resume-foreign-session/session_reader.py <tool> list --cwd <cwd>
 ```
 
-`<tool>` is one of `claude`, `codex`, `cursor`, `amp`, `devin`.
+`<tool>` is one of `claude`, `codex`, `cursor`, `amp`, `devin`, `opencode`.
 
 - `show latest` selects the newest session for the current working directory;
   if none exists, it falls back to the most recent session across all
