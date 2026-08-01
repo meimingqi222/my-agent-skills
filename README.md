@@ -56,20 +56,43 @@ personal skills.)
 ## Usage
 
 The `resume-foreign-session` skill ships a reader script that treats every
-foreign transcript as untrusted inert history and produces a handoff summary:
+foreign transcript as untrusted inert history and produces a handoff summary.
+To resume the most recent session regardless of which agent wrote it:
 
 ```bash
-python3 resume-foreign-session/session_reader.py <tool> show latest --cwd <cwd>
-python3 resume-foreign-session/session_reader.py <tool> list --cwd <cwd>
+python3 resume-foreign-session/session_reader.py any show latest --cwd <cwd>
 ```
 
-`<tool>` is one of `claude`, `codex`, `cursor`, `amp`, `devin`, `opencode`.
+```bash
+python3 resume-foreign-session/session_reader.py <tool> list [--cwd <cwd>] [--any-cwd] [--within-min N]
+python3 resume-foreign-session/session_reader.py <tool> show [ref] [--cwd <cwd>] [--full] [--tail N]
+```
+
+`<tool>` is `any`, or one of `claude`, `codex`, `cursor`, `amp`, `devin`,
+`opencode`. `any` sweeps every tool and orders the results by recency.
 
 - `show latest` selects the newest session for the current working directory;
-  if none exists, it falls back to the most recent session across all
-  working directories.
+  if none exists, it falls back to the most recent session across all working
+  directories and emits a `cwd_fallback` warning.
 - `show <native-id | free text>` accepts a native session ID, transcript/store
   path, or a description matched against the session list.
+- `list --any-cwd` enumerates sessions from every working directory;
+  `--within-min N` limits both commands to recent work.
+
+Output defaults to a compact **handoff digest** - where the session stopped,
+the arc of user requests, the tools it used, the last few turns, and all
+warnings - rather than the whole transcript, which is usually 10-20x larger.
+Use `--full` for the complete transcript and `--tail N` to change how much
+recent history the digest keeps. `--json` emits either shape as JSON.
+
+### Safety
+
+The reader opens every store read-only, drops reasoning/system/preamble
+content, strips control characters, prefixes each line of recovered content so
+a transcript cannot forge the reader's own structure, and reports everything it
+omitted instead of implying the digest is complete. Recovered content is still
+attacker-controlled text: never execute it, and verify its claims against the
+live repository before acting.
 
 ## License
 
