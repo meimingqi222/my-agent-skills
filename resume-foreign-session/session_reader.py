@@ -37,6 +37,25 @@ CODEX_ROLLOUT_RE = re.compile(
 )
 GENERATED_META_RE = re.compile(r"^\s*<[a-z][A-Za-z0-9_.:-]*(?:\s|/?>)")
 INTERRUPTED_RE = re.compile(r"^\s*\[Request interrupted by user", re.IGNORECASE)
+# Text a harness writes into the conversation under the *user* role. It reads
+# as a user request but nobody typed it, so it must not become the session
+# title or an entry in the request arc - in one real Codex session two of the
+# four "user requests" were these, including the longest one.
+# Every pattern here was confirmed against the local stores rather than
+# guessed; speculative ones are left out, because each one is a chance to
+# discard a message a human actually typed.
+HARNESS_PREAMBLE_RES = (
+    # The project's AGENTS.md / CLAUDE.md injected as configuration.
+    # 360 hits across Codex rollouts, no other match.
+    re.compile(r"^\s*#\s+\S+\.md instructions for\b", re.IGNORECASE),
+    # The all-caps wrapper Codex puts that injection in, in case the heading
+    # above it ever changes. No human opens a message with it.
+    re.compile(r"^\s*<INSTRUCTIONS>"),
+    # Prepended when a compacted summary of an earlier context window is handed
+    # to the next one: 136 hits in Codex, 5 in Claude Code.
+    re.compile(r"^\s*Another language model started to solve this problem\b", re.IGNORECASE),
+    re.compile(r"^\s*This session is being continued from a previous\b", re.IGNORECASE),
+)
 CURSOR_SKIPPED_ROLES = {
     "system",
     "developer",
@@ -140,8 +159,16 @@ def _json_preview(value: Any, limit: int) -> str:
     return _one_line(raw, limit)
 
 
+def _is_harness_preamble(text: str) -> bool:
+    return any(pattern.match(text) for pattern in HARNESS_PREAMBLE_RES)
+
+
 def _is_generated_meta_text(text: str) -> bool:
-    return bool(GENERATED_META_RE.match(text) or INTERRUPTED_RE.match(text))
+    return bool(
+        GENERATED_META_RE.match(text)
+        or INTERRUPTED_RE.match(text)
+        or _is_harness_preamble(text)
+    )
 
 
 def _blocks(content: Any) -> list[dict[str, Any]]:
@@ -202,9 +229,372 @@ def _assistant_action(turn: dict[str, Any]) -> str:
     return ""
 
 
-def _finalize_result(result: dict[str, Any]) -> dict[str, Any]:
+# ─── Work index: which files were touched, and what the plan was ────────
+#
+# Everything below is extraction, never inference. Each entry names a real,
+# documented parameter of a real tool in one of the six supported agents, so a
+# session that recorded no plan reports "none" instead of a guess. Extraction
+# must run on raw tool input, before ``_json_preview`` truncates it: an Edit
+# payload longer than --max-tool-chars stops being parseable JSON, and the
+# file it touched silently disappears from the count.
+
+# Tool name (casefolded) -> (candidate path parameters, writes to the file).
+TOOL_PATH_PARAMS: dict[str, tuple[tuple[str, ...], bool]] = {
+    "edit": (("file_path", "filePath", "path"), True),
+    "multiedit": (("file_path", "filePath", "path"), True),
+    "write": (("file_path", "filePath", "path"), True),
+    "patch": (("file_path", "filePath", "path"), True),
+    "notebookedit": (("notebook_path", "notebookPath"), True),
+    "edit_file": (("target_file", "file_path", "path"), True),
+    "create_file": (("path", "file_path"), True),
+    "write_file": (("path", "file_path", "target_file"), True),
+    "search_replace": (("file_path", "path", "target_file"), True),
+    "str_replace": (("path", "file_path"), True),
+    "str_replace_editor": (("path", "file_path"), True),
+    "read": (("file_path", "filePath", "path"), False),
+    "read_file": (("target_file", "file_path", "path"), False),
+    "view": (("path", "file_path"), False),
+    "view_file": (("path", "file_path"), False),
+}
+# Tools whose payload is a patch: the paths come from the patch header.
+PATCH_TOOLS = {"apply_patch", "applypatch"}
+# Shell-ish tools. A path inside a command is evidence of interest only, never
+# proof of a write - `grep foo.py` must not report foo.py as modified.
+SHELL_TOOLS = {
+    "bash",
+    "shell",
+    "exec",
+    "local_shell",
+    "shell_command",
+    "run_command",
+    "run_terminal_cmd",
+    "terminal",
+    "powershell",
+}
+# Tool name (casefolded) -> (list parameter, item label keys, item status key).
+PLAN_TOOLS: dict[str, tuple[str, tuple[str, ...], str]] = {
+    "todowrite": ("todos", ("content", "activeForm", "task"), "status"),
+    "todo_write": ("todos", ("content", "task"), "status"),
+    "update_plan": ("plan", ("step", "content"), "status"),
+}
+TASK_LABEL_KEYS = ("activeForm", "description", "content", "title", "prompt")
+PATCH_PATH_RE = re.compile(
+    r"^\*\*\* (?:Add|Update|Delete) File: (.+)$|^\*\*\* Move to: (.+)$",
+    re.MULTILINE,
+)
+# `git commit -m "..."` inside a shell command. The message is the one record
+# of what the session decided it had finished, and the digest's 140-char tool
+# preview cuts it off long before the subject line ends.
+COMMIT_MSG_RE = re.compile(
+    r"git\s+commit\b[^\n]*?\s-[a-zA-Z]*m[a-zA-Z]*\s+"
+    r"(\"((?:[^\"\\]|\\.)*)\"|'([^']*)')",
+)
+# A heredoc body (`git commit -F -  <<'EOF' ... EOF`) or `-m` with no inline
+# message: the subject is the first non-empty line of the body.
+COMMIT_HEREDOC_RE = re.compile(
+    r"git\s+commit\b[^\n]*?<<-?\s*['\"]?(\w+)['\"]?\n(.*?)^\1$",
+    re.MULTILINE | re.DOTALL,
+)
+GIT_PUSH_RE = re.compile(r"git\s+push\b([^\n&|;]*)")
+SHELL_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]|\.{1,2}/|/)[\w./\\+-]*\.\w{1,8}")
+# Directories that belong to an agent or a build, not to the user's work.
+AGENT_INTERNAL_PARTS = {
+    ".agents",
+    ".amp",
+    ".claude",
+    ".codex",
+    ".cursor",
+    ".devin",
+    ".git",
+    ".opencode",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "site-packages",
+}
+PLAN_STATUS_MARKS = {
+    "completed": "x",
+    "done": "x",
+    "complete": "x",
+    "in_progress": ">",
+    "in-progress": ">",
+    "active": ">",
+    "pending": " ",
+    "todo": " ",
+    "not_started": " ",
+    "cancelled": "-",
+    "canceled": "-",
+    "skipped": "-",
+}
+
+
+def _as_dict(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+    return {}
+
+
+def _as_text(raw: Any) -> str:
+    if isinstance(raw, str):
+        return raw
+    try:
+        return json.dumps(raw, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return ""
+
+
+SHELL_COMMAND_KEYS = ("command", "cmd", "script", "shell_command", "input", "code")
+
+
+def _shell_command_text(raw: Any) -> str:
+    """Recover a shell command with its real newlines intact.
+
+    Serialising the argument object instead would turn every newline into a
+    literal backslash-n, which silently breaks heredoc matching - and heredocs
+    are exactly how agents pass multi-line commit messages.
+    """
+    if isinstance(raw, str):
+        return raw
+    args = _as_dict(raw)
+    for key in SHELL_COMMAND_KEYS:
+        value = args.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, list):
+            # Codex local_shell records argv, e.g. ["bash", "-lc", "git ..."].
+            parts = [item for item in value if isinstance(item, str)]
+            if parts:
+                return parts[-1] if len(parts) > 1 else parts[0]
+    return _as_text(raw)
+
+
+def _first_string(source: dict[str, Any], keys: Iterable[str]) -> str:
+    for key in keys:
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _normalize_base(cwd: str) -> str:
+    base = _safe_text(cwd).strip().replace("\\", "/").rstrip("/")
+    return base
+
+
+def _normalize_path(raw: str, cwd: str | None) -> str | None:
+    """Reduce a foreign path string to a comparable, displayable form.
+
+    Returns ``None`` for anything that is not usable as a project path. Paths
+    under ``cwd`` come back relative, which is also how ``files`` decides that
+    a bare shell-command path is worth keeping at all.
+    """
+    text = _safe_text(raw).strip().strip("\"'`")
+    if not text or "\n" in text:
+        return None
+    if "\\\\" in text:
+        # The path came out of JSON embedded in JSON (e.g. a shell command
+        # inside a tool argument), so one level of escaping is still on it.
+        text = text.replace("\\\\", "\\")
+    text = text.replace("\\", "/").rstrip("/")
+    if sys.platform == "win32":
+        # Git-bash spellings (/d/code/x) and native ones (D:/code/x) name the
+        # same file; fold them together so the count is not split.
+        match = re.match(r"^/([A-Za-z])/(.*)$", text)
+        if match:
+            text = f"{match.group(1).upper()}:/{match.group(2)}"
+    parts = [part for part in text.split("/") if part not in ("", ".")]
+    if not parts:
+        return None
+    if any(part.casefold() in AGENT_INTERNAL_PARTS for part in parts):
+        return None
+    if cwd:
+        base = _normalize_base(cwd)
+        if base and text.casefold().startswith(base.casefold() + "/"):
+            return text[len(base) + 1 :]
+    return text
+
+
+def _is_outside_cwd(path: str) -> bool:
+    return path.startswith("/") or bool(re.match(r"^[A-Za-z]:/", path))
+
+
+def _is_scratch(path: str) -> bool:
+    """True for scratch/temp locations - real writes, but not the user's work.
+
+    These are reported rather than hidden, just ranked below project files so a
+    session that wrote a dozen throwaway analysis scripts does not bury the two
+    source files it actually changed.
+    """
+    lowered = path.casefold().split("/")
+    return any(part in {"tmp", "temp", "scratchpad", ".cache"} for part in lowered)
+
+
+class WorkIndex:
+    """Accumulates file touches and plan state from raw tool calls."""
+
+    def __init__(self) -> None:
+        self._files: dict[str, dict[str, int]] = {}
+        self._shell: dict[str, int] = {}
+        self._plan: list[dict[str, str]] | None = None
+        self._plan_source: str | None = None
+        self._tasks: dict[str, dict[str, str]] = {}
+        self._commits: list[str] = []
+        self._pushed = False
+
+    def record(self, name: Any, raw: Any) -> None:
+        if not isinstance(name, str) or not name.strip():
+            return
+        key = name.strip().casefold()
+        # OpenCode records namespaced tools as e.g. ``functions.apply_patch``;
+        # the payload semantics are the same as the bare tool name.
+        key = key.rsplit(".", 1)[-1]
+        args = _as_dict(raw)
+        entry = TOOL_PATH_PARAMS.get(key)
+        if entry is not None:
+            params, mutates = entry
+            value = _first_string(args, params)
+            if value:
+                self._touch(value, mutates)
+        elif key in PATCH_TOOLS:
+            payload = next(
+                (
+                    args.get(field)
+                    for field in ("patchText", "patch_text", "patch", "input")
+                    if isinstance(args.get(field), str)
+                ),
+                raw if isinstance(raw, str) else "",
+            )
+            for match in PATCH_PATH_RE.findall(payload):
+                self._touch(next((value for value in match if value), ""), True)
+        elif key in SHELL_TOOLS:
+            command = _shell_command_text(raw)
+            for match in SHELL_PATH_RE.findall(command)[:8]:
+                self._shell[match] = self._shell.get(match, 0) + 1
+            self._record_git(command)
+
+        spec = PLAN_TOOLS.get(key)
+        if spec is not None:
+            list_key, label_keys, status_key = spec
+            items = args.get(list_key)
+            if isinstance(items, list):
+                plan = [
+                    {
+                        "status": str(item.get(status_key) or "pending"),
+                        "label": _first_string(item, label_keys),
+                    }
+                    for item in items
+                    if isinstance(item, dict)
+                ]
+                if plan:
+                    # Last write wins: the final call is the current state.
+                    self._plan = plan
+                    self._plan_source = name.strip()
+        elif key == "taskcreate":
+            # The harness numbers tasks in creation order, which is what
+            # TaskUpdate's taskId refers back to.
+            self._tasks[str(len(self._tasks) + 1)] = {
+                "status": "pending",
+                "label": _first_string(args, TASK_LABEL_KEYS),
+            }
+            self._plan_source = "TaskCreate/TaskUpdate"
+        elif key == "taskupdate":
+            task = self._tasks.get(str(args.get("taskId") or args.get("task_id") or ""))
+            if task is not None:
+                status = args.get("status")
+                if isinstance(status, str) and status:
+                    task["status"] = status
+                label = _first_string(args, TASK_LABEL_KEYS)
+                if label and not task["label"]:
+                    task["label"] = label
+
+    def _record_git(self, command: str) -> None:
+        """Recover commit subjects the digest's tool preview would truncate."""
+        for match in COMMIT_MSG_RE.finditer(command):
+            message = match.group(2) if match.group(2) is not None else match.group(3)
+            subject = _one_line((message or "").replace('\\"', '"'), 200)
+            if subject and subject not in self._commits:
+                self._commits.append(subject)
+        for match in COMMIT_HEREDOC_RE.finditer(command):
+            body = match.group(2) or ""
+            subject = next(
+                (_one_line(line, 200) for line in body.split("\n") if line.strip()), ""
+            )
+            if subject and subject not in self._commits:
+                self._commits.append(subject)
+        if not self._pushed:
+            for match in GIT_PUSH_RE.finditer(command):
+                # `git push --dry-run` is not a push.
+                if "--dry-run" not in match.group(1):
+                    self._pushed = True
+                    break
+
+    def _touch(self, raw_path: str, mutates: bool) -> None:
+        counts = self._files.setdefault(raw_path, {"write": 0, "read": 0})
+        counts["write" if mutates else "read"] += 1
+
+    def files(self, cwd: str | None) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+
+        def slot(path: str) -> dict[str, Any]:
+            return merged.setdefault(
+                path, {"path": path, "write": 0, "read": 0, "mentioned": 0}
+            )
+
+        for raw, counts in self._files.items():
+            path = _normalize_path(raw, cwd)
+            if path is None:
+                continue
+            entry = slot(path)
+            entry["write"] += counts["write"]
+            entry["read"] += counts["read"]
+        for raw, count in self._shell.items():
+            path = _normalize_path(raw, cwd)
+            # A path seen only inside a shell command is a hint, not a touch.
+            # Keep it only when it resolved to somewhere under this session's
+            # working directory, which is what drops screenshot and temp noise.
+            if path is None or _is_outside_cwd(path):
+                continue
+            slot(path)["mentioned"] += count
+        return sorted(
+            merged.values(),
+            key=lambda item: (
+                1 if _is_scratch(item["path"]) else 0,
+                0 if item["write"] else 1,
+                -item["write"],
+                -item["read"],
+                -item["mentioned"],
+                item["path"],
+            ),
+        )
+
+    def git_activity(self) -> dict[str, Any] | None:
+        if not self._commits and not self._pushed:
+            return None
+        return {"commits": list(self._commits), "pushed": self._pushed}
+
+    def plan(self) -> dict[str, Any] | None:
+        items = self._plan
+        if items is None and self._tasks:
+            items = [dict(task) for task in self._tasks.values()]
+        if not items:
+            return None
+        return {"source": self._plan_source or "plan", "items": items}
+
+
+def _finalize_result(
+    result: dict[str, Any], index: WorkIndex | None = None
+) -> dict[str, Any]:
     turns = result.setdefault("turns", [])
     warnings = result.setdefault("warnings", [])
+    result["files_touched"] = index.files(result.get("cwd")) if index else []
+    result["plan_state"] = index.plan() if index else None
+    result["git_activity"] = index.git_activity() if index else None
     result["last_user_request"] = next(
         (
             _one_line(turn["text"], 400)
@@ -671,6 +1061,7 @@ def _render_claude_record(
     record: dict[str, Any],
     max_tool_chars: int,
     replacement_ids: set[str],
+    index: WorkIndex | None = None,
 ) -> dict[str, Any] | None:
     if record.get("type") not in {"user", "assistant"}:
         return None
@@ -695,6 +1086,8 @@ def _render_claude_record(
             if isinstance(text, str) and text.strip() and not _is_generated_meta_text(text):
                 texts.append(_safe_text(text))
         elif block_type == "tool_use":
+            if index is not None:
+                index.record(block.get("name"), block.get("input", {}))
             tool_calls.append(
                 {
                     "id": block.get("id"),
@@ -848,7 +1241,9 @@ def _amp_cwd_from_tree(value: Any) -> str | None:
     return os.path.normpath(path)
 
 
-def _amp_turn_blocks(content: Any) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+def _amp_turn_blocks(
+    content: Any, index: WorkIndex | None = None
+) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
     """Split Amp message content blocks into text / tool_calls / tool_results."""
     texts: list[str] = []
     calls: list[dict[str, Any]] = []
@@ -866,6 +1261,8 @@ def _amp_turn_blocks(content: Any) -> tuple[list[str], list[dict[str, Any]], lis
             if isinstance(text, str) and text:
                 texts.append(text)
         elif block_type == "tool_use":
+            if index is not None:
+                index.record(block.get("name"), block.get("input"))
             calls.append(
                 {
                     "id": block.get("id"),
@@ -956,6 +1353,7 @@ def read_amp_session(path: Path | str, max_tool_chars: int = 300) -> dict[str, A
 
     turns: list[dict[str, Any]] = []
     unsafe_count = 0
+    index = WorkIndex()
     for message in messages:
         if not isinstance(message, dict):
             unsafe_count += 1
@@ -963,7 +1361,7 @@ def read_amp_session(path: Path | str, max_tool_chars: int = 300) -> dict[str, A
         role = message.get("role")
         if role not in {"user", "assistant"}:
             continue
-        texts, calls, results = _amp_turn_blocks(message.get("content"))
+        texts, calls, results = _amp_turn_blocks(message.get("content"), index)
         for text in texts:
             turns.append(_turn(role, text=text))
             for call in calls:
@@ -1007,7 +1405,7 @@ def read_amp_session(path: Path | str, max_tool_chars: int = 300) -> dict[str, A
         "turns": turns,
         "warnings": warnings,
     }
-    return _finalize_result(result)
+    return _finalize_result(result, index)
 
 
 def read_devin_cli_session(path: Path | str, max_tool_chars: int = 300) -> dict[str, Any]:
@@ -1056,6 +1454,7 @@ def read_devin_cli_session(path: Path | str, max_tool_chars: int = 300) -> dict[
 
     turns: list[dict[str, Any]] = []
     unsafe_count = 0
+    index = WorkIndex()
     for step in steps:
         if not isinstance(step, dict):
             unsafe_count += 1
@@ -1072,6 +1471,7 @@ def read_devin_cli_session(path: Path | str, max_tool_chars: int = 300) -> dict[
             for tool_call in step.get("tool_calls") or []:
                 if not isinstance(tool_call, dict):
                     continue
+                index.record(tool_call.get("function_name"), tool_call.get("arguments"))
                 calls.append(
                     {
                         "id": tool_call.get("tool_call_id"),
@@ -1132,7 +1532,7 @@ def read_devin_cli_session(path: Path | str, max_tool_chars: int = 300) -> dict[
         "warnings": warnings,
     }
     result["model"] = model_name
-    return _finalize_result(result)
+    return _finalize_result(result, index)
 
 
 def read_devin_next_session(
@@ -1142,6 +1542,7 @@ def read_devin_next_session(
 ) -> dict[str, Any]:
     database_path = Path(database_path).expanduser()
     warnings: list[dict[str, str]] = []
+    index = WorkIndex()
     try:
         with _open_sqlite_readonly(database_path) as database:
             row = database.execute(
@@ -1212,6 +1613,7 @@ def read_devin_next_session(
                             if block_type == "text" and isinstance(block.get("text"), str):
                                 text += block["text"]
                             elif block_type == "tool_use":
+                                index.record(block.get("name"), block.get("input"))
                                 tool_calls.append(
                                     {
                                         "id": block.get("id"),
@@ -1255,7 +1657,7 @@ def read_devin_next_session(
         "warnings": warnings,
     }
     result["model"] = model if isinstance(model, str) else None
-    return _finalize_result(result)
+    return _finalize_result(result, index)
 
 
 # ─── OpenCode ───────────────────────────────────────────────────────────
@@ -1304,6 +1706,7 @@ def read_opencode_session(
     database_path = Path(database_path).expanduser()
     warnings: list[dict[str, str]] = []
     turns: list[dict[str, Any]] = []
+    index = WorkIndex()
     try:
         with _open_sqlite_readonly(database_path) as database:
             row = database.execute(
@@ -1360,6 +1763,7 @@ def read_opencode_session(
                         if not isinstance(state, dict):
                             state = {}
                         call_id = part.get("callID") or part.get("id")
+                        index.record(part.get("tool"), state.get("input", {}))
                         calls.append(
                             {
                                 "id": call_id,
@@ -1410,7 +1814,7 @@ def read_opencode_session(
         "model": _opencode_model_id(model),
     }
     result["agent"] = agent if isinstance(agent, str) else None
-    return _finalize_result(result)
+    return _finalize_result(result, index)
 
 
 def _discover_opencode(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
@@ -1556,10 +1960,11 @@ def read_claude_session(path: Path | str, max_tool_chars: int = 300) -> dict[str
     if leaf is not None:
         chain, _ = _claude_chain(graph, messages, leaf, warnings)
     replacements = _claude_replacement_ids(records)
+    index = WorkIndex()
     turns = [
         turn
         for record in chain
-        for turn in [_render_claude_record(record, max_tool_chars, replacements)]
+        for turn in [_render_claude_record(record, max_tool_chars, replacements, index)]
         if turn is not None
     ]
     metadata_records = chain if chain else records
@@ -1598,7 +2003,7 @@ def read_claude_session(path: Path | str, max_tool_chars: int = 300) -> dict[str
         "turns": turns,
         "warnings": warnings,
     }
-    return _finalize_result(result)
+    return _finalize_result(result, index)
 
 
 def _codex_home() -> Path:
@@ -1659,18 +2064,33 @@ def _codex_message_text(item: dict[str, Any]) -> str:
 
 
 def _render_codex_item(
-    item: Any, max_tool_chars: int
+    item: Any, max_tool_chars: int, index: WorkIndex | None = None
 ) -> tuple[dict[str, Any] | None, bool]:
     if not isinstance(item, dict):
         return None, True
     item_type = item.get("type")
+    if index is not None and item_type in {
+        "function_call",
+        "local_shell_call",
+        "custom_tool_call",
+    }:
+        index.record(
+            "local_shell" if item_type == "local_shell_call" else item.get("name"),
+            item.get("arguments")
+            if item_type == "function_call"
+            else item.get("action")
+            if item_type == "local_shell_call"
+            else item.get("input"),
+        )
     if item_type == "message":
         role = item.get("role")
         if role not in {"user", "assistant"}:
             return None, role in {"system", "developer"}
         text = _codex_message_text(item)
         if not text:
-            return None, False
+            # Nothing renderable survived - reasoning, or a harness preamble
+            # wearing the user role. Count it so the drop is reported.
+            return None, True
         return _turn(role, text=text), False
     if item_type == "function_call":
         return (
@@ -1781,18 +2201,19 @@ def read_codex_session(path: Path | str, max_tool_chars: int = 300) -> dict[str,
     )
     base_items: list[Any] = []
     start_index = 0
-    for index, record in enumerate(records):
+    for position, record in enumerate(records):
         if record.get("type") != "compacted":
             continue
         payload = record.get("payload")
         replacement = payload.get("replacement_history") if isinstance(payload, dict) else None
         if isinstance(replacement, list):
             base_items = replacement
-            start_index = index + 1
+            start_index = position + 1
     turns: list[dict[str, Any]] = []
     unsafe_count = 0
+    index = WorkIndex()
     for item in base_items:
-        turn, unsafe = _render_codex_item(item, max_tool_chars)
+        turn, unsafe = _render_codex_item(item, max_tool_chars, index)
         unsafe_count += int(unsafe)
         if turn is not None:
             turns.append(turn)
@@ -1800,7 +2221,7 @@ def read_codex_session(path: Path | str, max_tool_chars: int = 300) -> dict[str,
         record_type = record.get("type")
         payload = record.get("payload")
         if record_type == "response_item":
-            turn, unsafe = _render_codex_item(payload, max_tool_chars)
+            turn, unsafe = _render_codex_item(payload, max_tool_chars, index)
             unsafe_count += int(unsafe)
             if turn is not None:
                 turns.append(turn)
@@ -1860,7 +2281,10 @@ def read_codex_session(path: Path | str, max_tool_chars: int = 300) -> dict[str,
         "turns": turns,
         "warnings": warnings,
     }
-    return _finalize_result(result)
+    if isinstance(git.get("commit_hash"), str):
+        # The commit the session started from - the anchor for reading its diff.
+        result["base_commit"] = git["commit_hash"]
+    return _finalize_result(result, index)
 
 
 def cursor_workspace_hash(cwd: str) -> str:
@@ -2158,7 +2582,7 @@ def _cursor_user_text(text: str) -> str | None:
 
 
 def _render_cursor_role_value(
-    value: Any, max_tool_chars: int
+    value: Any, max_tool_chars: int, index: WorkIndex | None = None
 ) -> tuple[list[dict[str, Any]], bool]:
     if not isinstance(value, dict):
         return [], False
@@ -2198,6 +2622,10 @@ def _render_cursor_role_value(
                     if rendered:
                         texts.append(rendered)
             elif block_type in {"tool_use", "tool_call"}:
+                if index is not None:
+                    index.record(
+                        block.get("name"), block.get("input", block.get("arguments", {}))
+                    )
                 calls.append(
                     {
                         "id": block.get("id") or block.get("call_id"),
@@ -2224,6 +2652,11 @@ def _render_cursor_role_value(
                 if not isinstance(call, dict):
                     continue
                 function = call.get("function") if isinstance(call.get("function"), dict) else call
+                if index is not None:
+                    index.record(
+                        function.get("name"),
+                        function.get("arguments", function.get("input", {})),
+                    )
                 calls.append(
                     {
                         "id": call.get("id") or function.get("call_id"),
@@ -2262,7 +2695,9 @@ def _render_cursor_role_value(
         if isinstance(nested, list):
             skipped = False
             for item in nested:
-                item_turns, item_skipped = _render_cursor_role_value(item, max_tool_chars)
+                item_turns, item_skipped = _render_cursor_role_value(
+                    item, max_tool_chars, index
+                )
                 turns.extend(item_turns)
                 skipped |= item_skipped
             return turns, skipped
@@ -2285,6 +2720,7 @@ def _read_cursor_values(
     *,
     max_tool_chars: int,
     warnings: list[dict[str, str]],
+    index: WorkIndex | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     turns: list[dict[str, Any]] = []
     source_root: str | None = None
@@ -2298,7 +2734,7 @@ def _read_cursor_values(
             unavailable += 1
             continue
         source_root = source_root or _find_nested_string(value, "sourceRepoRootPath")
-        value_turns, skipped = _render_cursor_role_value(value, max_tool_chars)
+        value_turns, skipped = _render_cursor_role_value(value, max_tool_chars, index)
         turns.extend(value_turns)
         unsafe += int(skipped)
     if unavailable:
@@ -2323,7 +2759,10 @@ def _read_cursor_values(
 
 
 def _read_cursor_transcript(
-    path: Path, max_tool_chars: int, warnings: list[dict[str, str]]
+    path: Path,
+    max_tool_chars: int,
+    warnings: list[dict[str, str]],
+    index: WorkIndex | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     records, malformed = _read_plain_jsonl(path)
     if malformed:
@@ -2333,7 +2772,10 @@ def _read_cursor_transcript(
             f"Skipped {malformed} malformed Cursor transcript record(s).",
         )
     return _read_cursor_values(
-        enumerate(records), max_tool_chars=max_tool_chars, warnings=warnings
+        enumerate(records),
+        max_tool_chars=max_tool_chars,
+        warnings=warnings,
+        index=index,
     )
 
 
@@ -2375,6 +2817,7 @@ def read_cursor_session(
     candidate: dict[str, Any], max_tool_chars: int = 300
 ) -> dict[str, Any]:
     warnings: list[dict[str, str]] = []
+    index = WorkIndex()
     session_id = str(candidate.get("session_id") or "")
     source = str(candidate.get("source") or "cursor")
     path = Path(str(candidate.get("path") or "")).expanduser()
@@ -2390,7 +2833,9 @@ def read_cursor_session(
         else _ordered_cursor_transcript(session_id)
     )
     if transcript is not None:
-        turns, source_root = _read_cursor_transcript(transcript, max_tool_chars, warnings)
+        turns, source_root = _read_cursor_transcript(
+            transcript, max_tool_chars, warnings, index
+        )
         selected_path = transcript
     elif source == "cursor-desktop" or path.name == "state.vscdb":
         selected_path = path
@@ -2400,6 +2845,7 @@ def read_cursor_session(
                     _cursor_desktop_rows(database, session_id),
                     max_tool_chars=max_tool_chars,
                     warnings=warnings,
+                    index=index,
                 )
                 try:
                     row = database.execute(
@@ -2428,6 +2874,7 @@ def read_cursor_session(
                     _cursor_cli_store_rows(database),
                     max_tool_chars=max_tool_chars,
                     warnings=warnings,
+                    index=index,
                 )
         else:
             turns, source_root = [], None
@@ -2459,7 +2906,7 @@ def read_cursor_session(
         "turns": turns,
         "warnings": warnings,
     }
-    return _finalize_result(result)
+    return _finalize_result(result, index)
 
 
 def _discover_claude(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
@@ -2877,6 +3324,59 @@ def _sort_and_dedupe(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return deduped
 
 
+# Environment variables through which a host agent names the session it is
+# currently writing. Handing an agent its own transcript back is never a
+# handoff, so `show latest` skips these unless asked not to.
+CURRENT_SESSION_ENV = (
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+    "CODEX_SESSION_ID",
+    "CURSOR_SESSION_ID",
+    "AMP_THREAD_ID",
+    "OPENCODE_SESSION_ID",
+    "DEVIN_SESSION_ID",
+)
+
+
+# A session updated this recently may still have an agent attached to it,
+# writing to the same working tree. Resuming it is a race, not a handoff.
+LIVE_SESSION_MINUTES = 5
+
+
+def _warn_if_live(result: dict[str, Any], now_ms: int | None = None) -> None:
+    updated = _timestamp_to_millis(result.get("updated_at"))
+    if updated is None:
+        return
+    now = int(time.time() * 1000) if now_ms is None else now_ms
+    age_ms = now - updated
+    if not 0 <= age_ms <= LIVE_SESSION_MINUTES * 60 * 1000:
+        return
+    _add_warning(
+        result.setdefault("warnings", []),
+        "session_may_be_live",
+        f"This session was written to {max(1, age_ms // 60000)} minute(s) ago, so "
+        f"another agent may still be running in {result.get('cwd') or 'its working directory'}. "
+        "Confirm it has stopped before editing the same files.",
+    )
+    result["warnings"].sort(key=lambda item: (item["code"], item["message"]))
+
+
+def current_session_ids() -> set[str]:
+    ids: set[str] = set()
+    for name in CURRENT_SESSION_ENV:
+        value = os.environ.get(name)
+        if value and value.strip():
+            ids.add(value.strip().casefold())
+    return ids
+
+
+def _excluded(session: dict[str, Any], exclude: set[str]) -> bool:
+    if not exclude:
+        return False
+    identifier = str(session.get("session_id") or "").casefold()
+    return bool(identifier) and identifier in exclude
+
+
 def discover_sessions(
     tool: str, cwd: str | None, within_min: int = 0
 ) -> list[dict[str, Any]]:
@@ -3122,6 +3622,7 @@ def resolve_session(
     cwd: str,
     within_min: int = 0,
     any_cwd: bool = False,
+    exclude: set[str] | None = None,
 ) -> dict[str, Any]:
     ref = (reference or "").strip()
     if not ref or ref.casefold() == "latest":
@@ -3130,10 +3631,21 @@ def resolve_session(
         path_candidate = _candidate_from_path(name, ref, cwd)
         if path_candidate is not None:
             return path_candidate
-    sessions = discover_sessions(tool, None if any_cwd else cwd, within_min)
+    # An explicitly named session is always honoured; only the implicit
+    # "newest one" needs protecting from selecting the caller's own session.
+    skip = exclude or set() if ref == "latest" else set()
+    sessions = [
+        item
+        for item in discover_sessions(tool, None if any_cwd else cwd, within_min)
+        if not _excluded(item, skip)
+    ]
     if ref == "latest":
         if not sessions and not any_cwd:
-            sessions = discover_sessions(tool, None, within_min)
+            sessions = [
+                item
+                for item in discover_sessions(tool, None, within_min)
+                if not _excluded(item, skip)
+            ]
             if sessions:
                 # The newest session lives under a different working directory.
                 # Flag it so the caller can warn instead of silently handing the
@@ -3222,6 +3734,36 @@ def _tool_histogram(turns: list[dict[str, Any]]) -> list[tuple[str, int]]:
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))
 
 
+def _digest_selection(
+    turns: list[dict[str, Any]], tail: int, narration_limit: int
+) -> tuple[list[int], int, int]:
+    """Choose which turns the digest keeps.
+
+    Recency alone is the wrong axis. A long session is mostly tool traffic -
+    in a 247-turn Codex session, 234 turns were calls and results and only 9
+    were the assistant explaining what it had done. Those 9 are the handoff and
+    they cost a few KB, so keep them plus the tail, which is where the session
+    actually stopped.
+
+    The newest narrations win when there are more than ``narration_limit`` of
+    them: a 3,500-turn session can hold hundreds, and an unbounded digest stops
+    being a digest. Returns the chosen positions with the narration totals so
+    the caller can report what it dropped.
+    """
+    narrations = [
+        position
+        for position, turn in enumerate(turns)
+        if turn.get("role") == "assistant" and turn.get("text")
+    ]
+    kept = narrations[-narration_limit:] if narration_limit > 0 else narrations
+    keep = set(kept)
+    if tail > 0:
+        keep.update(range(max(0, len(turns) - tail), len(turns)))
+    else:
+        keep.update(range(len(turns)))
+    return sorted(keep), len(narrations), len(kept)
+
+
 def build_digest(
     result: dict[str, Any],
     *,
@@ -3229,13 +3771,16 @@ def build_digest(
     arc_chars: int = 180,
     turn_chars: int = 400,
     call_chars: int = 140,
+    file_limit: int = 14,
+    narration_limit: int = 30,
 ) -> dict[str, Any]:
     """Distil a parsed session into the minimum needed to resume the work.
 
-    Keeps what a handoff needs - the arc of what the user asked for, where the
-    session stopped, and what failed - and drops the bulk of the transcript,
-    which is stale tool output the skill's own safety boundary says must be
-    re-verified anyway. Elision is counted and reported, never silent.
+    Keeps what a handoff needs - which files were touched, what the plan was,
+    the arc of what the user asked for, where the session stopped, and what
+    failed - and drops the bulk of the transcript, which is stale tool output
+    the skill's own safety boundary says must be re-verified anyway. Elision is
+    counted and reported, never silent.
     """
     turns = result.get("turns") or []
     arc = [
@@ -3243,13 +3788,18 @@ def build_digest(
         for turn in turns
         if turn.get("role") == "user" and turn.get("text")
     ]
-    start = max(0, len(turns) - tail) if tail > 0 else 0
+    selection, narration_total, narration_shown = _digest_selection(
+        turns, tail, narration_limit
+    )
     recent: list[dict[str, Any]] = []
     shown_results = 0
-    for turn in turns[start:]:
+    previous = -1
+    for position in selection:
+        turn = turns[position]
         item: dict[str, Any] = {
             "role": turn.get("role") or "?",
             "text": _one_line(turn.get("text") or "", turn_chars),
+            "gap": position - previous - 1,
             "tool_calls": [
                 {
                     "name": _safe_text(call.get("name") or "unknown"),
@@ -3259,6 +3809,7 @@ def build_digest(
             ],
             "tool_results": [],
         }
+        previous = position
         elided_here = 0
         for output in turn.get("tool_results") or []:
             # Successful output is stale evidence and must be re-verified, so it
@@ -3278,21 +3829,28 @@ def build_digest(
         item["tool_results_elided"] = elided_here
         recent.append(item)
     total_results = sum(len(turn.get("tool_results") or []) for turn in turns)
+    files = result.get("files_touched") or []
     return {
         "turns_total": len(turns),
         "turns_shown": len(recent),
-        "turns_omitted": start,
+        "turns_omitted": len(turns) - len(recent),
+        "narration_total": narration_total,
+        "narration_shown": narration_shown,
         "tool_results_total": total_results,
         "tool_results_shown": shown_results,
         "tool_results_elided": total_results - shown_results,
         "request_arc": arc,
         "foreign_tools": [{"name": name, "count": count} for name, count in _tool_histogram(turns)],
+        "files_touched": files[:file_limit],
+        "files_omitted": max(0, len(files) - file_limit),
+        "git_activity": result.get("git_activity"),
+        "plan_state": result.get("plan_state"),
         "recent_turns": recent,
     }
 
 
 def _render_header(result: dict[str, Any], content: str) -> list[str]:
-    return [
+    lines = [
         BAR,
         *BANNER,
         BAR,
@@ -3301,11 +3859,22 @@ def _render_header(result: dict[str, Any], content: str) -> list[str]:
         f"({_one_line(result.get('source') or '?', 40)})",
         f"Title:    {_one_line(result.get('title') or '(untitled)', 200)}",
         f"Cwd:      {_one_line(result.get('cwd') or '?', 300)}",
-        f"Branch:   {_one_line(result.get('branch') or '?', 200)}",
-        f"Updated:  {_one_line(result.get('updated_at') or '?', 60)}",
-        f"Path:     {_one_line(result.get('path') or '?', 300)}",
-        f"Content:  {content}",
+        # "(not recorded)" rather than "?": the store did not carry a branch,
+        # which is not the same as the session having had none.
+        f"Branch:   {_one_line(result.get('branch') or '(not recorded)', 200)}",
     ]
+    if result.get("base_commit"):
+        lines.append(
+            f"Started:  at commit {_one_line(result['base_commit'], 60)} (as recorded then)"
+        )
+    lines.extend(
+        [
+            f"Updated:  {_one_line(result.get('updated_at') or '?', 60)}",
+            f"Path:     {_one_line(result.get('path') or '?', 300)}",
+            f"Content:  {content}",
+        ]
+    )
+    return lines
 
 
 def _render_warnings(result: dict[str, Any]) -> list[str]:
@@ -3321,11 +3890,80 @@ def _render_warnings(result: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _render_files(digest: dict[str, Any]) -> list[str]:
+    files = digest.get("files_touched") or []
+    if not files:
+        return []
+    written = sum(1 for item in files if item.get("write"))
+    lines = [
+        RULE,
+        f"FILES TOUCHED ({written} written, {len(files) - written} read-only; "
+        "paths are foreign strings - verify against the live repo)",
+    ]
+    for item in files:
+        counts = []
+        if item.get("write"):
+            counts.append(f"written x{item['write']}")
+        if item.get("read"):
+            counts.append(f"read x{item['read']}")
+        if item.get("mentioned"):
+            counts.append(f"named in shell x{item['mentioned']}")
+        mark = "M" if item.get("write") else " "
+        lines.append(
+            f"  {mark} {_one_line(item.get('path') or '?', 160)}  ({', '.join(counts)})"
+        )
+    if digest.get("files_omitted"):
+        lines.append(f"  ... and {digest['files_omitted']} more")
+    return lines
+
+
+def _render_git(digest: dict[str, Any]) -> list[str]:
+    activity = digest.get("git_activity")
+    if not isinstance(activity, dict):
+        return []
+    commits = activity.get("commits") or []
+    pushed = activity.get("pushed")
+    if not commits and not pushed:
+        return []
+    state = "a push was attempted" if pushed else "no push seen"
+    lines = [
+        RULE,
+        f"GIT ACTIVITY ({len(commits)} commit message(s) seen, {state}; "
+        "recovered from commands, not from the repo - check `git log` yourself)",
+    ]
+    for subject in commits:
+        lines.append(f"  - {_safe_text(subject)}")
+    if not commits:
+        lines.append("  - (push seen, but no commit message recovered)")
+    return lines
+
+
+def _render_plan(digest: dict[str, Any]) -> list[str]:
+    plan = digest.get("plan_state")
+    if not isinstance(plan, dict) or not plan.get("items"):
+        return []
+    items = plan["items"]
+    done = sum(1 for item in items if str(item.get("status")) in {"completed", "done", "complete"})
+    lines = [
+        RULE,
+        f"PLAN AS THE SESSION LAST RECORDED IT "
+        f"({done}/{len(items)} done, via {_one_line(plan.get('source') or 'plan', 40)}; "
+        "the previous agent's claim, not verified state)",
+    ]
+    for item in items:
+        status = str(item.get("status") or "pending")
+        mark = PLAN_STATUS_MARKS.get(status.casefold(), "?")
+        label = _one_line(item.get("label") or "(no description)", 150)
+        lines.append(f"  [{mark}] {label}")
+    return lines
+
+
 def render_digest(result: dict[str, Any], tail: int = 12) -> str:
     digest = build_digest(result, tail=tail)
     content = (
-        f"{digest['turns_total']} turns, showing last {digest['turns_shown']} "
-        f"(+{len(digest['request_arc'])} requests); use --full for everything"
+        f"{digest['turns_total']} turns, showing {digest['turns_shown']} "
+        f"(+{len(digest['request_arc'])} requests, "
+        f"{len(digest['files_touched'])} files); use --full for everything"
     )
     lines = _render_header(result, content)
     lines.append(RULE)
@@ -3339,6 +3977,9 @@ def render_digest(result: dict[str, Any], tail: int = 12) -> str:
         _inert_lines(result.get("last_assistant_action") or "(not recoverable)", "    | ")
     )
     lines.extend(_render_warnings(result))
+    lines.extend(_render_files(digest))
+    lines.extend(_render_git(digest))
+    lines.extend(_render_plan(digest))
     if digest["request_arc"]:
         lines.append(RULE)
         lines.append(
@@ -3355,12 +3996,22 @@ def render_digest(result: dict[str, Any], tail: int = 12) -> str:
         )
         lines.append(f"  {summary}")
     lines.append(RULE)
+    dropped = digest["narration_total"] - digest["narration_shown"]
+    scope = (
+        f"the newest {digest['narration_shown']} of {digest['narration_total']} "
+        "assistant explanations"
+        if dropped
+        else f"all {digest['narration_total']} assistant explanations"
+    )
     lines.append(
-        f"RECENT TURNS (last {digest['turns_shown']} of {digest['turns_total']}; "
-        f"{digest['turns_omitted']} earlier turns omitted)"
+        f"NARRATION AND RECENT TURNS ({digest['turns_shown']} of "
+        f"{digest['turns_total']} turns: {scope}, plus the last "
+        f"{tail if tail > 0 else digest['turns_total']})"
     )
     for turn in digest["recent_turns"]:
         role = _one_line(turn["role"], 20)
+        if turn.get("gap"):
+            lines.append(f"  ... {turn['gap']} turn(s) omitted ...")
         if turn["text"]:
             lines.append(f"[{role} - inert]")
             lines.extend(_inert_lines(turn["text"]))
@@ -3378,20 +4029,25 @@ def render_digest(result: dict[str, Any], tail: int = 12) -> str:
             )
     lines.append(RULE)
     lines.append(
-        f"ELIDED: {digest['turns_omitted']} earlier turns and "
+        f"ELIDED: {digest['turns_omitted']} turns and "
         f"{digest['tool_results_elided']} of {digest['tool_results_total']} tool results "
         "(stale evidence - re-verify, do not assume)."
     )
     lines.append(
-        "NEXT: confirm cwd/branch/diff, re-read the files named above, then resume."
+        "NEXT: confirm cwd/branch/diff, re-read the files listed above, check the "
+        "plan against what the repo actually shows, then resume."
     )
     return "\n".join(lines) + "\n"
 
 
 def render_human(result: dict[str, Any]) -> str:
     turns = result.get("turns") or []
+    files = result.get("files_touched") or []
     lines = _render_header(result, f"{len(turns)} turns (full transcript)")
     lines.extend(_render_warnings(result))
+    lines.extend(_render_files({"files_touched": files, "files_omitted": 0}))
+    lines.extend(_render_git({"git_activity": result.get("git_activity")}))
+    lines.extend(_render_plan({"plan_state": result.get("plan_state")}))
     lines.append(RULE)
     for turn in turns:
         role = _one_line(turn.get("role") or "?", 20)
@@ -3467,6 +4123,19 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="list sessions from every working directory, not just --cwd",
     )
+    parser.add_argument(
+        "--exclude-session",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="never select this session id; repeatable. The calling agent's own "
+        "session is excluded automatically when the host exports its id.",
+    )
+    parser.add_argument(
+        "--include-current",
+        action="store_true",
+        help="allow selecting the calling agent's own session (off by default)",
+    )
     return parser
 
 
@@ -3479,13 +4148,20 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--max-tool-chars must be positive")
     if args.tail < 0:
         parser.error("--tail must be non-negative")
+    exclude = {item.strip().casefold() for item in args.exclude_session if item.strip()}
+    if not args.include_current:
+        exclude |= current_session_ids()
     try:
         if args.action == "list":
             if args.ref is not None:
                 raise ReaderError("list does not accept a session reference")
-            sessions = discover_sessions(
-                args.tool, None if args.any_cwd else args.cwd, args.within_min
-            )
+            sessions = [
+                item
+                for item in discover_sessions(
+                    args.tool, None if args.any_cwd else args.cwd, args.within_min
+                )
+                if not _excluded(item, exclude)
+            ]
             if args.json:
                 print(
                     json.dumps(
@@ -3506,9 +4182,10 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return 0
         candidate = resolve_session(
-            args.tool, args.ref, args.cwd, args.within_min, args.any_cwd
+            args.tool, args.ref, args.cwd, args.within_min, args.any_cwd, exclude
         )
         result = read_resolved_session(candidate, args.max_tool_chars)
+        _warn_if_live(result)
         requested_cwd = candidate.get("cwd_fallback")
         if requested_cwd:
             _add_warning(
