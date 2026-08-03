@@ -10,7 +10,7 @@ Each skill lives in its own folder containing a `SKILL.md` (with the required
 
 | Skill | Description |
 | --- | --- |
-| [resume-foreign-session](resume-foreign-session/) | Resume or continue work from a recent session created by another coding agent: Claude Code, Codex, Cursor, AmpCode, Devin, OpenCode, or Qoder. Reads the foreign session transcripts, produces a safe handoff summary, and surfaces the most recent session even when run from a directory with no matching sessions. |
+| [resume-foreign-session](resume-foreign-session/) | Resume or continue work from a recent session created by another coding agent: Claude Code, Codex, Cursor, AmpCode, Devin, OpenCode, Qoder, or Command Code. Reads the foreign session transcripts, produces a safe handoff summary, and surfaces the most recent session even when run from a directory with no matching sessions. |
 
 ## Installation
 
@@ -70,7 +70,8 @@ python3 resume-foreign-session/session_reader.py <tool> show [ref] [--cwd <cwd>]
 ```
 
 `<tool>` is `any`, or one of `claude`, `codex`, `cursor`, `amp`, `devin`,
-`opencode`, `qoder`. `any` sweeps every tool and orders the results by recency.
+`opencode`, `qoder`, `commandcode` (`command-code` works too). `any` sweeps
+every tool and orders the results by recency.
 
 - `show latest` selects the newest session for the current working directory;
   if none exists, it falls back to the most recent session across all working
@@ -99,7 +100,13 @@ done may never have worked. Verify all of it against the repository.
 Text a harness wrote under the user role - an injected AGENTS.md, a compaction
 preamble - is dropped so it cannot pose as a user request or become the session
 title. Across 188 sessions this cleaned the request arc of 38 of them and
-emptied none.
+emptied none. When a transcript *begins* after an auto-compaction, the summary
+standing in for the missing turns is reported in its own **prior context**
+section instead, labelled as the previous agent's unverified account.
+
+A session the user rewound leaves the abandoned branch in the same transcript.
+The reader follows the parent chain to the newest leaf and reports how many
+records it skipped, so discarded work is not handed back as work that was done.
 
 A session written to within the last five minutes raises `session_may_be_live`:
 another agent may still be running in that directory.
@@ -121,9 +128,9 @@ live repository before acting.
 
 `resume-foreign-session` is derived from the grok CLI bundled skill
 `shared/resume-session` (Apache-2.0), which reads Claude Code, Codex, and
-Cursor sessions. This version adds the AmpCode, Devin, OpenCode, and Qoder
-readers, the handoff digest, and the work index behind the file, git, and plan
-extraction.
+Cursor sessions. This version adds the AmpCode, Devin, OpenCode, Qoder, and
+Command Code readers, the handoff digest, and the work index behind the file,
+git, and plan extraction.
 
 ## License
 

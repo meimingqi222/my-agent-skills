@@ -3,8 +3,8 @@
 
 Derived from the grok CLI bundled skill `shared/resume-session` (Apache-2.0),
 which reads Claude Code, Codex, and Cursor. Modified: added the AmpCode, Devin,
-OpenCode, and Qoder readers, the handoff digest, and the work index behind the
-file, git, and plan extraction.
+OpenCode, Qoder, and Command Code readers, the handoff digest, and the work
+index behind the file, git, and plan extraction.
 """
 
 from __future__ import annotations
@@ -30,9 +30,20 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-TOOLS = ("claude", "codex", "cursor", "amp", "devin", "opencode", "qoder")
+TOOLS = (
+    "claude",
+    "codex",
+    "cursor",
+    "amp",
+    "devin",
+    "opencode",
+    "qoder",
+    "commandcode",
+)
 ANY_TOOL = "any"
 SELECTABLE = TOOLS + (ANY_TOOL,)
+# Spellings a user is likely to type for a tool whose own name is hyphenated.
+TOOL_ALIASES = {"command-code": "commandcode", "cc": "commandcode"}
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -100,6 +111,13 @@ CLAUDE_KNOWN_TYPES = {
 QODER_KNOWN_TYPES = CLAUDE_KNOWN_TYPES | {
     "workspace-directories",
     "runtime-config",
+}
+# Command Code's typed schema (`version: 3`). Its older records carry no `type`
+# at all and are recognised by their `role`/`content`/`metadata` shape instead.
+COMMANDCODE_KNOWN_TYPES = {
+    "session",
+    "message",
+    "model_change",
 }
 CODEX_SAFE_TOP_LEVEL = {
     "session_meta",
@@ -258,14 +276,16 @@ TOOL_PATH_PARAMS: dict[str, tuple[tuple[str, ...], bool]] = {
     "write": (("file_path", "filePath", "path"), True),
     "patch": (("file_path", "filePath", "path"), True),
     "notebookedit": (("notebook_path", "notebookPath"), True),
-    "edit_file": (("target_file", "file_path", "path"), True),
+    # ``filePath``/``absolutePath`` are the pre-3 Command Code spellings; its
+    # current build uses the snake_case ones the other agents use.
+    "edit_file": (("target_file", "file_path", "filePath", "path"), True),
     "create_file": (("path", "file_path"), True),
-    "write_file": (("path", "file_path", "target_file"), True),
+    "write_file": (("path", "file_path", "filePath", "target_file"), True),
     "search_replace": (("file_path", "path", "target_file"), True),
     "str_replace": (("path", "file_path"), True),
     "str_replace_editor": (("path", "file_path"), True),
     "read": (("file_path", "filePath", "path"), False),
-    "read_file": (("target_file", "file_path", "path"), False),
+    "read_file": (("target_file", "file_path", "filePath", "absolutePath", "path"), False),
     "view": (("path", "file_path"), False),
     "view_file": (("path", "file_path"), False),
 }
@@ -316,6 +336,7 @@ AGENT_INTERNAL_PARTS = {
     ".amp",
     ".claude",
     ".codex",
+    ".commandcode",
     ".cursor",
     ".devin",
     ".git",
@@ -634,6 +655,9 @@ def _finalize_result(
         "created_at",
         "updated_at",
         "source_repo_root_path",
+        # A harness-written summary of history this transcript no longer holds.
+        # Only set when a store keeps one; see ``read_commandcode_session``.
+        "prior_context",
     ):
         result.setdefault(field, None)
     return result
@@ -697,6 +721,22 @@ def _claude_config_dir() -> Path:
 def _qoder_config_dir() -> Path:
     configured = os.environ.get("QODER_CONFIG_DIR")
     return Path(configured).expanduser() if configured else Path.home() / ".qoder"
+
+
+def _commandcode_config_dir() -> Path:
+    configured = os.environ.get("COMMANDCODE_CONFIG_DIR") or os.environ.get(
+        "COMMAND_CODE_CONFIG_DIR"
+    )
+    return Path(configured).expanduser() if configured else Path.home() / ".commandcode"
+
+
+def _commandcode_slug(cwd: str) -> str:
+    """Slugify a working directory the way Command Code names its project dir.
+
+    Same substitution as Claude Code's, then lowercased with the leading
+    separator dropped: `/Users/x/work/app` -> `users-x-work-app`.
+    """
+    return slugify(cwd).lower().lstrip("-")
 
 
 def _amp_data_dir() -> Path:
@@ -2111,6 +2151,461 @@ def read_qoder_session(path: Path | str, max_tool_chars: int = 300) -> dict[str,
     )
 
 
+# ─── Command Code ───────────────────────────────────────────────────────
+#
+# Command Code stores one `<session-id>.jsonl` per slugified working directory
+# under `~/.commandcode/projects/`, beside a `<session-id>.meta.json` sidecar
+# (title, model) and a `<session-id>.checkpoints.jsonl` rewind log this reader
+# does not need. Two record schemas appear in the same tree:
+#
+#   typed  (`version: 3`) - a `session` header holding `cwd`, then `message`
+#                           records wrapping Anthropic-shaped content blocks.
+#   legacy (`version: 2`) - flat `{id, parentId, role, content, metadata}`
+#                           records holding AI-SDK blocks (`tool-call`,
+#                           `tool-result`, `reasoning`) and a `gitBranch`.
+#
+# Both link through `parentId`, so the live thread is the parent chain from the
+# newest leaf - a rewind leaves the abandoned branch in the file.
+
+
+def _is_commandcode_typed(record: dict[str, Any]) -> bool:
+    return isinstance(record.get("type"), str) and isinstance(record.get("id"), str)
+
+
+def _is_commandcode_legacy(record: dict[str, Any]) -> bool:
+    """Report whether a record is a pre-3 Command Code message.
+
+    Those records carry no ``type``, so the shape has to identify them. The
+    ``metadata.source`` requirement is what keeps this from claiming another
+    agent's untyped records.
+    """
+    metadata = record.get("metadata")
+    return (
+        record.get("type") is None
+        and record.get("role") in {"user", "assistant", "tool"}
+        and isinstance(record.get("content"), list)
+        and isinstance(metadata, dict)
+        and isinstance(metadata.get("source"), str)
+    )
+
+
+def _commandcode_head(path: Path, limit: int = 200) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for _, line in zip(range(limit), handle):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    records.append(record)
+    except OSError:
+        return []
+    return records
+
+
+def _is_commandcode_transcript(path: Path) -> bool:
+    """Report whether a `.jsonl` file is a Command Code transcript.
+
+    Claude Code, Qoder, and Cursor all write `.jsonl` too, so an explicitly
+    named path has to be checked rather than assumed. A typed transcript opens
+    with a `session` record; a legacy one is recognised by its record shape.
+    """
+    for record in _commandcode_head(path, 20):
+        if record.get("type") == "session" and isinstance(record.get("id"), str):
+            return True
+        if record.get("type") == "message" and isinstance(record.get("message"), dict):
+            return True
+        if _is_commandcode_legacy(record):
+            return True
+    return False
+
+
+def _commandcode_sidecar(path: Path) -> dict[str, Any]:
+    """Read the `<session-id>.meta.json` sidecar, or `{}` if it is unusable."""
+    sidecar = path.with_name(f"{path.stem}.meta.json")
+    try:
+        with sidecar.open("r", encoding="utf-8", errors="replace") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _commandcode_role(record: dict[str, Any]) -> str | None:
+    message = record.get("message")
+    if isinstance(message, dict):
+        role = message.get("role")
+        return role if role in {"user", "assistant"} else None
+    role = record.get("role")
+    # A legacy `tool` record carries nothing but tool results; the turn model
+    # keeps them under the same role Codex results use.
+    return role if role in {"user", "assistant", "tool"} else None
+
+
+def _commandcode_content(record: dict[str, Any]) -> list[dict[str, Any]]:
+    message = record.get("message")
+    if isinstance(message, dict):
+        return _blocks(message.get("content"))
+    return _blocks(record.get("content"))
+
+
+def _commandcode_first_user_text(records: list[dict[str, Any]]) -> str | None:
+    for record in records:
+        if _commandcode_role(record) != "user":
+            continue
+        metadata = record.get("metadata")
+        if isinstance(metadata, dict) and (
+            metadata.get("isAutomated") or metadata.get("isSummary")
+        ):
+            continue
+        for block in _commandcode_content(record):
+            if block.get("type") != "text":
+                continue
+            text = block.get("text")
+            if isinstance(text, str) and text.strip() and not _is_generated_meta_text(text):
+                return text
+    return None
+
+
+def _commandcode_quick_meta(path: Path) -> dict[str, Any] | None:
+    """Extract listing metadata without rebuilding the whole transcript."""
+    head = _commandcode_head(path)
+    if not head:
+        return None
+    if not any(
+        record.get("type") in {"session", "message"} or _is_commandcode_legacy(record)
+        for record in head
+    ):
+        return None
+    cwd = next(
+        (
+            record["cwd"]
+            for record in head
+            if record.get("type") == "session" and isinstance(record.get("cwd"), str)
+        ),
+        None,
+    )
+    branch = next(
+        (
+            record["gitBranch"]
+            for record in reversed(head)
+            if isinstance(record.get("gitBranch"), str) and record["gitBranch"].strip()
+        ),
+        None,
+    )
+    sidecar = _commandcode_sidecar(path)
+    title = sidecar.get("title")
+    if not isinstance(title, str) or not title.strip():
+        title = _commandcode_first_user_text(head)
+    return {
+        "cwd": cwd,
+        "branch": branch if branch != "-" else None,
+        "title": _one_line(title, 200) or None,
+    }
+
+
+def _commandcode_chain(
+    records: list[dict[str, Any]], warnings: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    """Return the live thread: the parent chain ending at the newest leaf.
+
+    Command Code appends rewound branches to the same file, so file order alone
+    would replay work the user discarded. Non-message records (`session`,
+    `model_change`) sit in the chain too, so the walk goes through the whole
+    graph and keeps only what renders.
+    """
+    graph = {
+        str(record["id"]): record
+        for record in records
+        if isinstance(record.get("id"), str) and record["id"]
+    }
+    renderable = [
+        record
+        for record in records
+        if _commandcode_role(record) is not None and isinstance(record.get("id"), str)
+    ]
+    if not renderable:
+        return []
+    positions = {
+        str(record.get("id")): position for position, record in enumerate(records)
+    }
+    parents = {
+        str(record["parentId"])
+        for record in records
+        if isinstance(record.get("parentId"), str) and record["parentId"]
+    }
+    leaves = [record for record in renderable if str(record["id"]) not in parents]
+    leaf = max(
+        leaves or renderable,
+        key=lambda record: _timestamp_sort_key(
+            record, positions.get(str(record.get("id")), -1)
+        ),
+    )
+    chain: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    current: dict[str, Any] | None = leaf
+    while current is not None:
+        identifier = str(current.get("id"))
+        if identifier in seen:
+            _add_warning(
+                warnings,
+                "parent_cycle",
+                "A cycle was detected in the transcript parent chain; only the "
+                "recoverable suffix is shown.",
+            )
+            break
+        seen.add(identifier)
+        if _commandcode_role(current) is not None:
+            chain.append(current)
+        parent = current.get("parentId")
+        current = graph.get(str(parent)) if isinstance(parent, str) and parent else None
+    chain.reverse()
+    if not chain:
+        return renderable
+    dropped = len(renderable) - len(chain)
+    if dropped > 0:
+        _add_warning(
+            warnings,
+            "branch_records_skipped",
+            f"Skipped {dropped} record(s) on abandoned branches of the transcript "
+            "(the session was rewound); only the live thread is shown.",
+        )
+    return chain
+
+
+def _render_commandcode_record(
+    record: dict[str, Any],
+    max_tool_chars: int,
+    index: WorkIndex | None,
+    counters: dict[str, int],
+    summaries: list[str],
+) -> dict[str, Any] | None:
+    role = _commandcode_role(record)
+    if role is None:
+        return None
+    metadata = record.get("metadata")
+    if isinstance(metadata, dict):
+        if metadata.get("isSummary"):
+            # An auto-compaction summary the harness wrote under the user role.
+            # Command Code opens a fresh transcript at compaction, so this text
+            # is the only trace of what came before - it is kept as prior
+            # context rather than as a turn, where it would read as something
+            # the user typed.
+            counters["summary"] = counters.get("summary", 0) + 1
+            text = "\n".join(
+                _safe_text(block.get("text"))
+                for block in _commandcode_content(record)
+                if block.get("type") == "text" and isinstance(block.get("text"), str)
+            ).strip()
+            if text:
+                summaries.append(text)
+            return None
+        if metadata.get("isAutomated"):
+            # A slash-command expansion or an "Interrupted by user" marker:
+            # nobody typed it, so it must not read as a user request.
+            counters["automated"] = counters.get("automated", 0) + 1
+            return None
+    texts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    tool_results: list[dict[str, Any]] = []
+    for block in _commandcode_content(record):
+        block_type = block.get("type")
+        if block_type in {"thinking", "reasoning", "redacted_thinking", "signature"}:
+            continue
+        if block_type == "text":
+            text = block.get("text")
+            if isinstance(text, str) and text.strip() and not _is_generated_meta_text(text):
+                texts.append(_safe_text(text))
+        elif block_type == "image":
+            texts.append("[image content unavailable]")
+        elif block_type == "tool_use":
+            if index is not None:
+                index.record(block.get("name"), block.get("input", {}))
+            tool_calls.append(
+                {
+                    "id": block.get("id"),
+                    "name": _safe_text(block.get("name") or "unknown"),
+                    "input": _json_preview(block.get("input", {}), max_tool_chars),
+                    "inert": True,
+                }
+            )
+        elif block_type == "tool-call":
+            if index is not None:
+                index.record(block.get("toolName"), block.get("input", {}))
+            tool_calls.append(
+                {
+                    "id": block.get("toolCallId"),
+                    "name": _safe_text(block.get("toolName") or "unknown"),
+                    "input": _json_preview(block.get("input", {}), max_tool_chars),
+                    "inert": True,
+                }
+            )
+        elif block_type == "tool_result":
+            tool_results.append(
+                {
+                    "tool_use_id": block.get("tool_use_id"),
+                    "content": _one_line(_content_text(block.get("content")), max_tool_chars),
+                    "is_error": bool(block.get("is_error")),
+                    "unavailable": False,
+                    "inert": True,
+                }
+            )
+        elif block_type == "tool-result":
+            output = block.get("output")
+            value = output.get("value") if isinstance(output, dict) else output
+            tool_results.append(
+                {
+                    "tool_use_id": block.get("toolCallId"),
+                    "content": _json_preview(value, max_tool_chars),
+                    # The legacy schema reports a failure as an `error-text`
+                    # output rather than a flag.
+                    "is_error": isinstance(output, dict)
+                    and output.get("type") == "error-text",
+                    "unavailable": False,
+                    "inert": True,
+                }
+            )
+    text = "\n".join(item for item in texts if item.strip())
+    if not text and not tool_calls and not tool_results:
+        counters["empty"] = counters.get("empty", 0) + 1
+        return None
+    return _turn(role, text=text, tool_calls=tool_calls, tool_results=tool_results)
+
+
+def read_commandcode_session(
+    path: Path | str, max_tool_chars: int = 300, *, cwd_hint: str | None = None
+) -> dict[str, Any]:
+    session_path = Path(path).expanduser()
+    records, malformed = _read_plain_jsonl(session_path)
+    warnings: list[dict[str, str]] = []
+    if malformed:
+        _add_warning(
+            warnings,
+            "malformed_records_skipped",
+            f"Skipped {malformed} malformed Command Code transcript record(s).",
+        )
+    if not any(
+        record.get("type") in {"session", "message"} or _is_commandcode_legacy(record)
+        for record in records
+    ):
+        raise ReaderError(
+            f"{session_path} is not a Command Code transcript this reader can render "
+            "(no session, message, or legacy role records)."
+        )
+    unknown = sum(
+        1
+        for record in records
+        if isinstance(record.get("type"), str)
+        and record["type"] not in COMMANDCODE_KNOWN_TYPES
+    )
+    if unknown:
+        _add_warning(
+            warnings,
+            "unknown_records_skipped",
+            f"Skipped {unknown} unknown Command Code record(s) without interpreting "
+            "their payloads.",
+        )
+    chain = _commandcode_chain(records, warnings)
+    index = WorkIndex()
+    counters: dict[str, int] = {}
+    summaries: list[str] = []
+    turns = [
+        turn
+        for record in chain
+        for turn in [
+            _render_commandcode_record(record, max_tool_chars, index, counters, summaries)
+        ]
+        if turn is not None
+    ]
+    prior_context: dict[str, Any] | None = None
+    if summaries:
+        _add_warning(
+            warnings,
+            "history_compacted",
+            f"This transcript opens after an auto-compaction: {counters['summary']} "
+            "summary record(s) stand in for earlier turns that are not in this file. "
+            "The summary is reported as prior context and is the previous agent's "
+            "account, not verified state.",
+        )
+        text = "\n\n".join(summaries)
+        prior_context = {
+            "source": "auto-compaction summary",
+            "text": _safe_text(text[:PRIOR_CONTEXT_CHARS]),
+            "truncated": len(text) > PRIOR_CONTEXT_CHARS,
+        }
+    if counters.get("automated"):
+        _add_warning(
+            warnings,
+            "harness_text_dropped",
+            f"Dropped {counters['automated']} harness-written record(s) that wore the "
+            "user role (slash-command expansions, interruption markers).",
+        )
+    cwd = next(
+        (
+            record["cwd"]
+            for record in records
+            if record.get("type") == "session" and isinstance(record.get("cwd"), str)
+        ),
+        None,
+    )
+    if cwd is None and cwd_hint and _commandcode_slug(cwd_hint) == session_path.parent.name:
+        # A legacy transcript names no working directory, but the project
+        # directory it sits in is that directory slugified - so a caller-supplied
+        # cwd that slugifies to the same name is the one this session ran in.
+        cwd = cwd_hint
+    branch = next(
+        (
+            record["gitBranch"]
+            for record in reversed(chain)
+            if isinstance(record.get("gitBranch"), str) and record["gitBranch"].strip()
+        ),
+        None,
+    )
+    timestamps = [
+        record["timestamp"] for record in chain if isinstance(record.get("timestamp"), str)
+    ]
+    created = next(
+        (
+            record["timestamp"]
+            for record in records
+            if record.get("type") == "session" and isinstance(record.get("timestamp"), str)
+        ),
+        timestamps[0] if timestamps else None,
+    )
+    sidecar = _commandcode_sidecar(session_path)
+    title = sidecar.get("title")
+    if not isinstance(title, str) or not title.strip():
+        title = next(
+            (turn["text"] for turn in turns if turn["role"] == "user" and turn["text"]),
+            None,
+        )
+    result = {
+        "tool": "commandcode",
+        "source": "command-code",
+        "session_id": session_path.stem,
+        "path": str(session_path),
+        "title": _one_line(title, 200) or None,
+        "cwd": cwd,
+        "branch": branch if branch != "-" else None,
+        "created_at": created,
+        "updated_at": timestamps[-1]
+        if timestamps
+        else _iso_from_millis(_mtime_millis(session_path)),
+        "source_repo_root_path": None,
+        "prior_context": prior_context,
+        "turns": turns,
+        "warnings": warnings,
+    }
+    model = sidecar.get("model")
+    if isinstance(model, str) and model:
+        result["model"] = model
+    return _finalize_result(result, index)
+
+
 def _codex_home() -> Path:
     configured = os.environ.get("CODEX_HOME")
     return Path(configured).expanduser() if configured else Path.home() / ".codex"
@@ -3043,6 +3538,25 @@ def _discover_qoder(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
     )
 
 
+def _discover_commandcode(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
+    """Discover Command Code sessions.
+
+    Same `projects/<slug>/<session-id>.jsonl` layout as Claude Code, except the
+    slug is lowercased and has no leading separator. Its `.meta.json` sidecars
+    and `.checkpoints.jsonl` rewind logs are filtered out by the shared scan's
+    `.jsonl`-plus-UUID-stem rule.
+    """
+    return _discover_claude_layout(
+        _commandcode_config_dir() / "projects",
+        "commandcode",
+        "command-code",
+        _commandcode_quick_meta,
+        cwd,
+        within_min,
+        slug=_commandcode_slug,
+    )
+
+
 def _discover_claude_layout(
     projects: Path,
     tool: str,
@@ -3050,10 +3564,11 @@ def _discover_claude_layout(
     quick_meta: Callable[[Path], dict[str, Any] | None],
     cwd: str | None,
     within_min: int,
+    slug: Callable[[str], str] = slugify,
 ) -> list[dict[str, Any]]:
     if not projects.is_dir():
         return []
-    expected = projects / slugify(cwd) if cwd else None
+    expected = projects / slug(cwd) if cwd else None
     project_dirs: list[Path] = []
     if expected is not None and expected.is_dir() and not expected.is_symlink():
         project_dirs.append(expected)
@@ -3476,7 +3991,15 @@ CURRENT_SESSION_ENV = (
     "OPENCODE_SESSION_ID",
     "DEVIN_SESSION_ID",
     "QODER_SESSION_ID",
+    "COMMANDCODE_SESSION_ID",
+    "COMMAND_CODE_SESSION_ID",
 )
+
+
+# How much of a recovered compaction summary the digest keeps. Long enough for
+# the goal, the state, and the open tasks a real summary records; short enough
+# that it cannot dominate the digest it is one section of.
+PRIOR_CONTEXT_CHARS = 4000
 
 
 # A session updated this recently may still have an agent attached to it,
@@ -3546,6 +4069,8 @@ def discover_sessions(
         sessions = _discover_opencode(requested_cwd, within_min)
     elif tool == "qoder":
         sessions = _discover_qoder(requested_cwd, within_min)
+    elif tool == "commandcode":
+        sessions = _discover_commandcode(requested_cwd, within_min)
     else:
         sessions = _discover_cursor_cli(requested_cwd, within_min)
         sessions.extend(_discover_cursor_desktop(requested_cwd, within_min))
@@ -3565,11 +4090,28 @@ def _candidate_from_path(tool: str, raw_path: str, cwd: str) -> dict[str, Any] |
     if not path.exists() or path.is_symlink():
         return None
     updated = _mtime_millis(path)
-    # Claude and Cursor both accept a bare `.jsonl`, and Qoder's transcripts
-    # are `.jsonl` too, so under `any` the sweep order alone would decide who
-    # claims one. A path inside the Qoder store is Qoder's.
+    # Claude and Cursor both accept a bare `.jsonl`, and Qoder's and Command
+    # Code's transcripts are `.jsonl` too, so under `any` the sweep order alone
+    # would decide who claims one. A path inside a store belongs to its owner.
     if tool != "qoder" and _under(path, _qoder_config_dir()):
         return None
+    if tool != "commandcode" and _under(path, _commandcode_config_dir()):
+        return None
+    if (
+        tool == "commandcode"
+        and path.is_file()
+        and path.suffix == ".jsonl"
+        and _is_commandcode_transcript(path)
+    ):
+        return {
+            "tool": tool,
+            "source": "command-code",
+            "session_id": path.stem,
+            "path": str(path),
+            "title": None,
+            "cwd": cwd,
+            "updated_at_ms": updated,
+        }
     if tool == "claude" and path.is_file() and path.suffix == ".jsonl":
         return {
             "tool": tool,
@@ -3676,6 +4218,19 @@ def _find_qoder_id(session_id: str, cwd: str) -> dict[str, Any] | None:
         if not path.is_file() or not _is_qoder_cli_transcript(path):
             continue
         candidate = _candidate_from_path("qoder", str(path), cwd)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _find_commandcode_id(session_id: str, cwd: str) -> dict[str, Any] | None:
+    projects = _commandcode_config_dir() / "projects"
+    direct = projects / _commandcode_slug(cwd) / f"{session_id}.jsonl"
+    candidates = [direct]
+    if projects.is_dir():
+        candidates.extend(sorted(projects.glob(f"*/{session_id}.jsonl"), key=str))
+    for path in candidates:
+        candidate = _candidate_from_path("commandcode", str(path), cwd)
         if candidate is not None:
             return candidate
     return None
@@ -3795,6 +4350,7 @@ def _finders() -> dict[str, Any]:
         "devin": _find_devin_id,
         "opencode": _find_opencode_id,
         "qoder": _find_qoder_id,
+        "commandcode": _find_commandcode_id,
     }
 
 
@@ -3882,6 +4438,10 @@ def read_resolved_session(
         return read_opencode_session(candidate["path"], candidate["session_id"], max_tool_chars)
     if tool == "qoder":
         return read_qoder_session(candidate["path"], max_tool_chars)
+    if tool == "commandcode":
+        return read_commandcode_session(
+            candidate["path"], max_tool_chars, cwd_hint=candidate.get("cwd")
+        )
     return read_cursor_session(candidate, max_tool_chars)
 
 
@@ -4122,6 +4682,25 @@ def _render_git(digest: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _render_prior_context(result: dict[str, Any]) -> list[str]:
+    """Render the summary standing in for history the transcript no longer has.
+
+    Prefixed like every other block of recovered content: it is the previous
+    agent's account of its own work, not a record of it.
+    """
+    prior = result.get("prior_context")
+    if not isinstance(prior, dict) or not prior.get("text"):
+        return []
+    note = " (truncated)" if prior.get("truncated") else ""
+    return [
+        RULE,
+        f"PRIOR CONTEXT ({_one_line(prior.get('source') or 'summary', 60)}{note} - "
+        "harness-written, inert, and unverified; the turns it covers are not in "
+        "this transcript)",
+        *_inert_lines(prior["text"]),
+    ]
+
+
 def _render_plan(digest: dict[str, Any]) -> list[str]:
     plan = digest.get("plan_state")
     if not isinstance(plan, dict) or not plan.get("items"):
@@ -4164,6 +4743,7 @@ def render_digest(result: dict[str, Any], tail: int = 12) -> str:
     lines.extend(_render_files(digest))
     lines.extend(_render_git(digest))
     lines.extend(_render_plan(digest))
+    lines.extend(_render_prior_context(result))
     if digest["request_arc"]:
         lines.append(RULE)
         lines.append(
@@ -4232,6 +4812,7 @@ def render_human(result: dict[str, Any]) -> str:
     lines.extend(_render_files({"files_touched": files, "files_omitted": 0}))
     lines.extend(_render_git({"git_activity": result.get("git_activity")}))
     lines.extend(_render_plan({"plan_state": result.get("plan_state")}))
+    lines.extend(_render_prior_context(result))
     lines.append(RULE)
     for turn in turns:
         role = _one_line(turn.get("role") or "?", 20)
@@ -4284,7 +4865,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Read foreign coding-agent sessions as inert history."
     )
-    parser.add_argument("tool", choices=SELECTABLE)
+    parser.add_argument("tool", choices=SELECTABLE + tuple(TOOL_ALIASES))
     parser.add_argument("action", choices=("list", "show"))
     parser.add_argument("ref", nargs="?")
     parser.add_argument("--cwd", default=os.getcwd())
@@ -4326,6 +4907,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    args.tool = TOOL_ALIASES.get(args.tool, args.tool)
     if args.within_min < 0:
         parser.error("--within-min must be non-negative")
     if args.max_tool_chars < 1:
