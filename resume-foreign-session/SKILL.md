@@ -2,21 +2,24 @@
 name: resume-foreign-session
 description: >
   Resume or continue work from a recent session created by another coding agent:
-  Claude Code, Codex, Cursor, AmpCode, Devin, or OpenCode. Use when the user
-  switched tools and wants to pick up where a previous session left off, or
+  Claude Code, Codex, Cursor, AmpCode, Devin, OpenCode, or Qoder. Use when the
+  user switched tools and wants to pick up where a previous session left off, or
   names a session from one of those tools by description, path, or native ID.
 license: Apache-2.0
 metadata:
-  author: extracted-from-grok-build
-  tools: claude-code, codex, cursor, ampcode, devin, opencode
+  author: meimingqi222
+  derived-from: >
+    grok CLI bundled skill `shared/resume-session` (Apache-2.0); extended with
+    AmpCode, Devin, OpenCode, and Qoder support and a handoff digest.
+  tools: claude-code, codex, cursor, ampcode, devin, opencode, qoder
 ---
 
 # Resume a foreign coding-agent session
 
 This skill reads sessions created by **Claude Code** (`claude`), **Codex**
-(`codex`), **Cursor** (`cursor`), **AmpCode** (`amp`), **Devin** (`devin`), or
-**OpenCode** (`opencode`) and produces a safe handoff so you can continue the
-user's work in this session.
+(`codex`), **Cursor** (`cursor`), **AmpCode** (`amp`), **Devin** (`devin`),
+**OpenCode** (`opencode`), or **Qoder** (`qoder`) and produces a safe handoff so
+you can continue the user's work in this session.
 
 ## Start here
 
@@ -27,7 +30,7 @@ command answers it:
 python3 <skill-dir>/session_reader.py any show latest --cwd <cwd>
 ```
 
-`any` sweeps all six tools and picks the globally newest session. The default
+`any` sweeps all seven tools and picks the globally newest session. The default
 output is a **handoff digest**, typically under 10 KB rather than the whole
 transcript:
 
@@ -61,7 +64,7 @@ python3 session_reader.py <tool> show [ref] [--cwd <cwd>] [--full] [--tail N] [-
 ```
 
 `<tool>` is `any`, or one of `claude`, `codex`, `cursor`, `amp`, `devin`,
-`opencode`. Prefer `any` unless the user named a tool.
+`opencode`, `qoder`. Prefer `any` unless the user named a tool.
 
 Arguments for `show`:
 
@@ -72,7 +75,9 @@ Arguments for `show`:
   warning** - when you see it, confirm the project is the one the user meant
   before acting. Devin CLI transcripts whose project root cannot be inferred
   are excluded from per-directory listings but remain reachable by native
-  session ID.
+  session ID. Qoder transcripts written by pre-1.1 builds, and its IDE-side
+  stores, use schemas this reader does not render; they are skipped rather
+  than shown as empty sessions.
 - **A native session ID or transcript/store path** — accepted directly.
 - **Free text** — matched against the tool's `list` results. If the text is
   ambiguous, the reader exits with all matches; never guess, show the

@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Read Claude Code, Codex, and Cursor sessions as untrusted inert history."""
+"""Read foreign coding-agent sessions as untrusted inert history.
+
+Derived from the grok CLI bundled skill `shared/resume-session` (Apache-2.0),
+which reads Claude Code, Codex, and Cursor. Modified: added the AmpCode, Devin,
+OpenCode, and Qoder readers, the handoff digest, and the work index behind the
+file, git, and plan extraction.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +22,7 @@ import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 for _stream in (sys.stdout, sys.stderr):
     try:
@@ -24,7 +30,7 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-TOOLS = ("claude", "codex", "cursor", "amp", "devin", "opencode")
+TOOLS = ("claude", "codex", "cursor", "amp", "devin", "opencode", "qoder")
 ANY_TOOL = "any"
 SELECTABLE = TOOLS + (ANY_TOOL,)
 UUID_RE = re.compile(
@@ -87,6 +93,13 @@ CLAUDE_KNOWN_TYPES = {
     "permission-mode",
     "attachment",
     "file-history-delta",
+}
+# Qoder's CLI writes Claude Code's record schema with two extra bookkeeping
+# types. Listing them keeps the reader from reporting its own store as
+# unrecognised.
+QODER_KNOWN_TYPES = CLAUDE_KNOWN_TYPES | {
+    "workspace-directories",
+    "runtime-config",
 }
 CODEX_SAFE_TOP_LEVEL = {
     "session_meta",
@@ -681,6 +694,11 @@ def _claude_config_dir() -> Path:
     return Path(configured).expanduser() if configured else Path.home() / ".claude"
 
 
+def _qoder_config_dir() -> Path:
+    configured = os.environ.get("QODER_CONFIG_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".qoder"
+
+
 def _amp_data_dir() -> Path:
     configured = os.environ.get("AMP_DATA_DIR")
     if configured:
@@ -755,9 +773,14 @@ def _is_claude_boundary(record: dict[str, Any]) -> bool:
 
 
 def _claude_parent(record: dict[str, Any]) -> str | None:
+    # A record that names itself as its parent is a root marker, not a link:
+    # Qoder's `/new` writes the opening record with `parentUuid == uuid`.
+    # Following it would look like a cycle and warn about history that was in
+    # fact recovered in full.
+    uuid = record.get("uuid")
     for field in ("parentUuid", "logicalParentUuid"):
         parent = record.get(field)
-        if isinstance(parent, str) and parent:
+        if isinstance(parent, str) and parent and parent != uuid:
             return parent
     return None
 
@@ -817,7 +840,7 @@ def _apply_claude_preserved_segment(
             _add_warning(
                 warnings,
                 "preserved_segment_unavailable",
-                "Claude preserved-segment metadata was incomplete; pre-compact history was retained.",
+                "Preserved-segment metadata was incomplete; pre-compact history was retained.",
             )
             return
         current = messages.get(tail)
@@ -838,7 +861,7 @@ def _apply_claude_preserved_segment(
             _add_warning(
                 warnings,
                 "preserved_segment_unavailable",
-                "Claude preserved-segment messages were missing or cyclic; pre-compact history was retained.",
+                "Preserved-segment messages were missing or cyclic; pre-compact history was retained.",
             )
             return
         _set_claude_parent(messages[head], anchor)
@@ -915,7 +938,7 @@ def _claude_leaf(
                 _add_warning(
                     warnings,
                     "parent_cycle",
-                    "A cycle was detected in the Claude parent chain; only the recoverable suffix is shown.",
+                    "A cycle was detected in the transcript parent chain; only the recoverable suffix is shown.",
                 )
                 break
             seen.add(current_uuid)
@@ -957,7 +980,7 @@ def _claude_chain(
             _add_warning(
                 warnings,
                 "parent_cycle",
-                "A cycle was detected in the Claude parent chain; only the recoverable suffix is shown.",
+                "A cycle was detected in the transcript parent chain; only the recoverable suffix is shown.",
             )
             break
         seen.add(uuid)
@@ -1928,7 +1951,21 @@ def _common_project_root(paths: list[str]) -> str | None:
     return root
 
 
-def read_claude_session(path: Path | str, max_tool_chars: int = 300) -> dict[str, Any]:
+def read_claude_session(
+    path: Path | str,
+    max_tool_chars: int = 300,
+    *,
+    tool: str = "claude",
+    source: str = "claude-code",
+    label: str = "Claude",
+    known_types: set[str] = CLAUDE_KNOWN_TYPES,
+) -> dict[str, Any]:
+    """Render a transcript written in Claude Code's record schema.
+
+    Qoder's CLI writes the same schema, so it reuses this renderer through
+    ``read_qoder_session``; the keyword arguments only change how the result
+    and its warnings name the originating tool.
+    """
     session_path = Path(path).expanduser()
     records, malformed = _read_plain_jsonl(session_path)
     warnings: list[dict[str, str]] = []
@@ -1936,18 +1973,18 @@ def read_claude_session(path: Path | str, max_tool_chars: int = 300) -> dict[str
         _add_warning(
             warnings,
             "malformed_records_skipped",
-            f"Skipped {malformed} malformed Claude transcript record(s).",
+            f"Skipped {malformed} malformed {label} transcript record(s).",
         )
     unknown = sum(
         1
         for record in records
-        if isinstance(record.get("type"), str) and record.get("type") not in CLAUDE_KNOWN_TYPES
+        if isinstance(record.get("type"), str) and record.get("type") not in known_types
     )
     if unknown:
         _add_warning(
             warnings,
             "unknown_records_skipped",
-            f"Skipped {unknown} unknown Claude record(s) without interpreting their payloads.",
+            f"Skipped {unknown} unknown {label} record(s) without interpreting their payloads.",
         )
     messages, scoped = _prepare_claude_messages(records, warnings)
     graph = {
@@ -1990,8 +2027,8 @@ def read_claude_session(path: Path | str, max_tool_chars: int = 300) -> dict[str
         if isinstance(record.get("timestamp"), str)
     ]
     result = {
-        "tool": "claude",
-        "source": "claude-code",
+        "tool": tool,
+        "source": source,
         "session_id": session_path.name.removesuffix(".jsonl"),
         "path": str(session_path),
         "title": _claude_title(records, turns),
@@ -2004,6 +2041,74 @@ def read_claude_session(path: Path | str, max_tool_chars: int = 300) -> dict[str
         "warnings": warnings,
     }
     return _finalize_result(result, index)
+
+
+def _qoder_head_types(path: Path) -> set[str]:
+    """Return the message record types found in a Qoder transcript's head.
+
+    Two facts are read off this: whether the file uses the typed schema this
+    reader renders, and whether it holds an exchange at all. A real session
+    reaches an assistant record within the first handful of lines.
+    """
+    found: set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for _, line in zip(range(200), handle):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(record, dict)
+                    and record.get("type") in {"user", "assistant"}
+                    and isinstance(record.get("uuid"), str)
+                    and isinstance(record.get("message"), dict)
+                ):
+                    found.add(str(record["type"]))
+    except OSError:
+        return set()
+    return found
+
+
+def _is_qoder_cli_transcript(path: Path) -> bool:
+    """Report whether a Qoder transcript uses the schema this reader renders.
+
+    Current Qoder CLI builds write Claude Code's typed records. Older builds
+    wrote a flat ``{id, parent_id, role, parts}`` shape, and both can sit in
+    the same ``projects/`` tree. Requiring the typed schema means a legacy file
+    is skipped outright rather than rendered as an empty session.
+    """
+    return bool(_qoder_head_types(path))
+
+
+def _qoder_quick_meta(path: Path) -> dict[str, Any] | None:
+    # Qoder opens a fresh transcript on every `/resume`, holding the slash
+    # command and nothing else. Its mtime is newer than the session it resumed,
+    # so listing it would let `show latest` hand back an empty handoff.
+    # Requiring an assistant record keeps those stubs out of discovery; they
+    # stay reachable by explicit id or path.
+    if "assistant" not in _qoder_head_types(path):
+        return None
+    return _claude_quick_meta(path)
+
+
+def read_qoder_session(path: Path | str, max_tool_chars: int = 300) -> dict[str, Any]:
+    session_path = Path(path).expanduser()
+    if not _is_qoder_cli_transcript(session_path):
+        raise ReaderError(
+            f"{session_path} is not a Qoder CLI transcript this reader can render "
+            "(no typed user/assistant records; likely a legacy `parts` transcript)."
+        )
+    return read_claude_session(
+        session_path,
+        max_tool_chars,
+        tool="qoder",
+        source="qoder-cli",
+        label="Qoder",
+        known_types=QODER_KNOWN_TYPES,
+    )
 
 
 def _codex_home() -> Path:
@@ -2910,7 +3015,42 @@ def read_cursor_session(
 
 
 def _discover_claude(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
-    projects = _claude_config_dir() / "projects"
+    return _discover_claude_layout(
+        _claude_config_dir() / "projects",
+        "claude",
+        "claude-code",
+        _claude_quick_meta,
+        cwd,
+        within_min,
+    )
+
+
+def _discover_qoder(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
+    """Discover Qoder CLI sessions.
+
+    Qoder stores them the way Claude Code does - one `<session-id>.jsonl` per
+    slugified working directory. Its per-session side-car directories and the
+    IDE's `transcript/` subdirectory are directories, so the shared file scan
+    skips them without special-casing.
+    """
+    return _discover_claude_layout(
+        _qoder_config_dir() / "projects",
+        "qoder",
+        "qoder-cli",
+        _qoder_quick_meta,
+        cwd,
+        within_min,
+    )
+
+
+def _discover_claude_layout(
+    projects: Path,
+    tool: str,
+    source: str,
+    quick_meta: Callable[[Path], dict[str, Any] | None],
+    cwd: str | None,
+    within_min: int,
+) -> list[dict[str, Any]]:
     if not projects.is_dir():
         return []
     expected = projects / slugify(cwd) if cwd else None
@@ -2944,7 +3084,7 @@ def _discover_claude(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
             updated = _mtime_millis(path)
             if not _within(updated, within_min):
                 continue
-            result = _claude_quick_meta(path)
+            result = quick_meta(path)
             if result is None:
                 continue
             if cwd is not None:
@@ -2955,8 +3095,8 @@ def _discover_claude(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
             seen.add(path.stem)
             sessions.append(
                 {
-                    "tool": "claude",
-                    "source": "claude-code",
+                    "tool": tool,
+                    "source": source,
                     "session_id": path.stem,
                     "path": str(path),
                     "title": result.get("title") or "(untitled)",
@@ -3335,6 +3475,7 @@ CURRENT_SESSION_ENV = (
     "AMP_THREAD_ID",
     "OPENCODE_SESSION_ID",
     "DEVIN_SESSION_ID",
+    "QODER_SESSION_ID",
 )
 
 
@@ -3403,10 +3544,20 @@ def discover_sessions(
         sessions.extend(_discover_devin_next(requested_cwd, within_min))
     elif tool == "opencode":
         sessions = _discover_opencode(requested_cwd, within_min)
+    elif tool == "qoder":
+        sessions = _discover_qoder(requested_cwd, within_min)
     else:
         sessions = _discover_cursor_cli(requested_cwd, within_min)
         sessions.extend(_discover_cursor_desktop(requested_cwd, within_min))
     return _sort_and_dedupe(sessions)
+
+
+def _under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _candidate_from_path(tool: str, raw_path: str, cwd: str) -> dict[str, Any] | None:
@@ -3414,10 +3565,25 @@ def _candidate_from_path(tool: str, raw_path: str, cwd: str) -> dict[str, Any] |
     if not path.exists() or path.is_symlink():
         return None
     updated = _mtime_millis(path)
+    # Claude and Cursor both accept a bare `.jsonl`, and Qoder's transcripts
+    # are `.jsonl` too, so under `any` the sweep order alone would decide who
+    # claims one. A path inside the Qoder store is Qoder's.
+    if tool != "qoder" and _under(path, _qoder_config_dir()):
+        return None
     if tool == "claude" and path.is_file() and path.suffix == ".jsonl":
         return {
             "tool": tool,
             "source": "claude-code",
+            "session_id": path.stem,
+            "path": str(path),
+            "title": None,
+            "cwd": cwd,
+            "updated_at_ms": updated,
+        }
+    if tool == "qoder" and path.is_file() and path.suffix == ".jsonl":
+        return {
+            "tool": tool,
+            "source": "qoder-cli",
             "session_id": path.stem,
             "path": str(path),
             "title": None,
@@ -3495,6 +3661,21 @@ def _find_claude_id(session_id: str, cwd: str) -> dict[str, Any] | None:
         candidates.extend(sorted(projects.glob(f"*/{session_id}.jsonl"), key=str))
     for path in candidates:
         candidate = _candidate_from_path("claude", str(path), cwd)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _find_qoder_id(session_id: str, cwd: str) -> dict[str, Any] | None:
+    projects = _qoder_config_dir() / "projects"
+    direct = projects / slugify(cwd) / f"{session_id}.jsonl"
+    candidates = [direct]
+    if projects.is_dir():
+        candidates.extend(sorted(projects.glob(f"*/{session_id}.jsonl"), key=str))
+    for path in candidates:
+        if not path.is_file() or not _is_qoder_cli_transcript(path):
+            continue
+        candidate = _candidate_from_path("qoder", str(path), cwd)
         if candidate is not None:
             return candidate
     return None
@@ -3613,6 +3794,7 @@ def _finders() -> dict[str, Any]:
         "amp": _find_amp_id,
         "devin": _find_devin_id,
         "opencode": _find_opencode_id,
+        "qoder": _find_qoder_id,
     }
 
 
@@ -3698,6 +3880,8 @@ def read_resolved_session(
         return read_devin_cli_session(candidate["path"], max_tool_chars)
     if tool == "opencode":
         return read_opencode_session(candidate["path"], candidate["session_id"], max_tool_chars)
+    if tool == "qoder":
+        return read_qoder_session(candidate["path"], max_tool_chars)
     return read_cursor_session(candidate, max_tool_chars)
 
 

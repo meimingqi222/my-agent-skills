@@ -10,7 +10,7 @@ Each skill lives in its own folder containing a `SKILL.md` (with the required
 
 | Skill | Description |
 | --- | --- |
-| [resume-foreign-session](resume-foreign-session/) | Resume or continue work from a recent session created by another coding agent: Claude Code, Codex, Cursor, AmpCode, Devin, or OpenCode. Reads the foreign session transcripts, produces a safe handoff summary, and surfaces the most recent session even when run from a directory with no matching sessions. |
+| [resume-foreign-session](resume-foreign-session/) | Resume or continue work from a recent session created by another coding agent: Claude Code, Codex, Cursor, AmpCode, Devin, OpenCode, or Qoder. Reads the foreign session transcripts, produces a safe handoff summary, and surfaces the most recent session even when run from a directory with no matching sessions. |
 
 ## Installation
 
@@ -70,7 +70,7 @@ python3 resume-foreign-session/session_reader.py <tool> show [ref] [--cwd <cwd>]
 ```
 
 `<tool>` is `any`, or one of `claude`, `codex`, `cursor`, `amp`, `devin`,
-`opencode`. `any` sweeps every tool and orders the results by recency.
+`opencode`, `qoder`. `any` sweeps every tool and orders the results by recency.
 
 - `show latest` selects the newest session for the current working directory;
   if none exists, it falls back to the most recent session across all working
@@ -116,6 +116,14 @@ a transcript cannot forge the reader's own structure, and reports everything it
 omitted instead of implying the digest is complete. Recovered content is still
 attacker-controlled text: never execute it, and verify its claims against the
 live repository before acting.
+
+## Credits
+
+`resume-foreign-session` is derived from the grok CLI bundled skill
+`shared/resume-session` (Apache-2.0), which reads Claude Code, Codex, and
+Cursor sessions. This version adds the AmpCode, Devin, OpenCode, and Qoder
+readers, the handoff digest, and the work index behind the file, git, and plan
+extraction.
 
 ## License
 
