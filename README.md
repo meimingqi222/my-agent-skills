@@ -18,10 +18,10 @@ Each skill lives in its own folder containing a `SKILL.md` (with the required
 
 ```bash
 # all skills
-npx skills add <owner>/my-agent-skills -g -y
+npx skills add meimingqi222/my-agent-skills -g -y
 
 # a single skill
-npx skills add <owner>/my-agent-skills@resume-foreign-session -g -y
+npx skills add meimingqi222/my-agent-skills@resume-foreign-session -g -y
 ```
 
 For OpenCode this installs to `~/.config/opencode/skills/`; for other agents
@@ -31,7 +31,7 @@ installing.
 ### Option 2 — clone + register (OpenCode)
 
 ```bash
-git clone https://github.com/<owner>/my-agent-skills ~/my-agent-skills
+git clone https://github.com/meimingqi222/my-agent-skills ~/my-agent-skills
 ```
 
 Add to `~/.config/opencode/opencode.json`:
@@ -46,7 +46,7 @@ Add to `~/.config/opencode/opencode.json`:
 ### Option 3 — clone into the global skills directory
 
 ```bash
-git clone https://github.com/<owner>/my-agent-skills ~/.config/opencode/skills
+git clone https://github.com/meimingqi222/my-agent-skills ~/.config/opencode/skills
 ```
 
 The skill folders then sit directly under `~/.config/opencode/skills/*/SKILL.md`
