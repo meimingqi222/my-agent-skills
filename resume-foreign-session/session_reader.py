@@ -754,18 +754,53 @@ def _devin_data_dirs() -> list[Path]:
 
     Devin stores its session data under a base directory with two subdirs:
     `cli` (ATIF JSON transcripts) and `cli-next` (SQLite sessions.db).
-    The base defaults to `%APPDATA%/devin` on Windows and `~/.devin`
-    elsewhere; `DEVIN_CONFIG_DIR` overrides the whole base.
+    `DEVIN_CONFIG_DIR` overrides the whole base; otherwise the candidate
+    locations differ per platform:
+
+    - Windows: `%LOCALAPPDATA%\\devin` (Devin Next app) and
+      `%APPDATA%\\devin` (legacy CLI), falling back to `~\\.devin`.
+    - macOS: `~/.local/share/devin` (XDG, Devin Next app), `~/.devin`
+      (legacy CLI), and `~/Library/Application Support/devin`.
+    - Linux/other: `$XDG_DATA_HOME/devin` then `~/.local/share/devin`,
+      then `~/.devin`.
+
+    Only roots that exist are returned (unless the override is set, which is
+    always returned so callers can surface the failure).
     """
     base = os.environ.get("DEVIN_CONFIG_DIR")
     if base:
-        root = Path(base).expanduser()
-    elif sys.platform == "win32":
+        return [Path(base).expanduser() / name for name in ("cli-next", "cli")]
+
+    candidates: list[Path] = []
+    home = Path.home()
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            candidates.append(Path(local_appdata).expanduser() / "devin")
         appdata = os.environ.get("APPDATA")
-        root = Path(appdata).expanduser() / "devin" if appdata else Path.home() / ".devin"
+        if appdata:
+            candidates.append(Path(appdata).expanduser() / "devin")
+        candidates.append(home / ".devin")
+    elif sys.platform == "darwin":
+        candidates.append(home / ".local" / "share" / "devin")
+        candidates.append(home / ".devin")
+        candidates.append(home / "Library" / "Application Support" / "devin")
     else:
-        root = Path.home() / ".devin"
-    return [root / name for name in ("cli-next", "cli")]
+        xdg_data = os.environ.get("XDG_DATA_HOME")
+        if xdg_data:
+            candidates.append(Path(xdg_data).expanduser() / "devin")
+        candidates.append(home / ".local" / "share" / "devin")
+        candidates.append(home / ".devin")
+
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for root in candidates:
+        if root in seen:
+            continue
+        seen.add(root)
+        if root.is_dir():
+            roots.append(root)
+    return [root / name for root in roots for name in ("cli-next", "cli")]
 
 
 def _read_plain_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
