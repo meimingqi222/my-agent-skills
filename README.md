@@ -57,7 +57,15 @@ personal skills.)
 
 The `resume-foreign-session` skill ships a reader script that treats every
 foreign transcript as untrusted inert history and produces a handoff summary.
-To resume the most recent session regardless of which agent wrote it:
+Inside a running agent, `SKILL.md` resolves the script's path itself: Claude
+Code v2.1.64+ expands `${CLAUDE_SKILL_DIR}` to the skill directory, and other
+harnesses fall back to the standard install locations - first
+`~/.agents/skills/`, the Agent Skills open-standard location `npx skills`
+targets for most agents, then the per-agent directories (`~/.claude/skills/`,
+`~/.config/opencode/skills/`, `~/.codex/skills/`, `~/.cursor/skills/`, project
+`.agents/skills/` and `.claude/skills/`) - before globbing, so no manual path
+lookup is needed. From a shell in this repository you can point at the script
+directly:
 
 ```bash
 python3 resume-foreign-session/session_reader.py any show latest --cwd <cwd>

@@ -14,6 +14,9 @@ metadata:
     AmpCode, Devin, OpenCode, Qoder, and Command Code support and a handoff
     digest.
   tools: claude-code, codex, cursor, ampcode, devin, opencode, qoder, command-code
+  # Claude Code v2.1.129+ expands ${CLAUDE_SKILL_DIR} here so the reader runs
+  # without a permission prompt; other harnesses ignore this field.
+allowed-tools: Bash(${CLAUDE_SKILL_DIR}/session_reader.py *)
 ---
 
 # Resume a foreign coding-agent session
@@ -27,10 +30,10 @@ you can continue the user's work in this session.
 ## Start here
 
 When the user says "continue where I left off" and does not name a tool, one
-command answers it:
+command answers it (resolve `$READER` first - see **Locate the reader** below):
 
 ```bash
-python3 <skill-dir>/session_reader.py any show latest --cwd <cwd>
+python3 "$READER" any show latest --cwd <cwd>
 ```
 
 `any` sweeps all eight tools and picks the globally newest session. The default
@@ -56,16 +59,48 @@ reads its id from the host's environment (`CLAUDE_CODE_SESSION_ID` and
 equivalents). Pass `--include-current` to override, or `--exclude-session ID`
 to skip others. A session named explicitly by id is always honoured.
 
-`<skill-dir>` is the directory holding this file. Use its absolute path - your
-working directory is the user's project, not the skill. Use `python` or `py -3`
-when `python3` is unavailable.
+## Locate the reader
+
+The reader script lives next to this file. Never glob for it first - resolve
+it once, cheapest source first:
+
+1. **Claude Code v2.1.64+** - the harness already expanded
+   `${CLAUDE_SKILL_DIR}` to this skill's directory when it loaded this file.
+   Use it directly and skip the rest:
+
+   ```bash
+   READER="${CLAUDE_SKILL_DIR}/session_reader.py"
+   ```
+
+2. **Other harnesses** - `~/.agents/skills` is the Agent Skills open-standard
+   location that `npx skills` installs to for most agents (Amp, Cline, Cursor,
+   OpenCode, Replit, and others); a few agents (Claude Code, Codex, OpenCode
+   global, Cursor global, ...) use their own directories instead. Test the
+   standard locations in one command; it exits at the first hit, and globs
+   only as a last resort:
+
+   ```bash
+   for d in "${CLAUDE_SKILL_DIR:-}" "$HOME/.agents/skills" \
+            "$HOME/.claude/skills" "$HOME/.config/opencode/skills" \
+            "$HOME/.codex/skills" "$HOME/.cursor/skills" \
+            ".agents/skills" ".claude/skills"; do
+     [ -f "$d/resume-foreign-session/session_reader.py" ] \
+       && READER="$d/resume-foreign-session/session_reader.py" && break
+   done
+   [ -n "${READER:-}" ] || READER="$(find "$HOME" . -maxdepth 6 \
+     -path '*/resume-foreign-session/session_reader.py' 2>/dev/null | head -1)"
+   ```
+
+Then run `python3 "$READER" …` as below. Use `python` or `py -3` when
+`python3` is unavailable. `<cwd>` is the directory you were launched in - your
+working directory is the user's project, not the skill.
 
 ## Locate and read
 
 ```bash
-python3 session_reader.py <tool> list [--cwd <cwd>] [--any-cwd] [--within-min N] [--json]
-python3 session_reader.py <tool> show [ref] [--cwd <cwd>] [--full] [--tail N] [--json]
-                                       [--exclude-session ID] [--include-current]
+python3 "$READER" <tool> list [--cwd <cwd>] [--any-cwd] [--within-min N] [--json]
+python3 "$READER" <tool> show [ref] [--cwd <cwd>] [--full] [--tail N] [--json]
+                                      [--exclude-session ID] [--include-current]
 ```
 
 `<tool>` is `any`, or one of `claude`, `codex`, `cursor`, `amp`, `devin`,
