@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Read foreign coding-agent sessions as untrusted inert history.
 
-Derived from the grok CLI bundled skill `shared/resume-session` (Apache-2.0),
+Derived from the Grok CLI bundled skill `shared/resume-session` (Apache-2.0),
 which reads Claude Code, Codex, and Cursor. Modified: added the AmpCode, Devin,
-OpenCode, Qoder, and Command Code readers, the handoff digest, and the work
-index behind the file, git, and plan extraction.
+OpenCode, Qoder, Command Code, Grok, and zcode readers, the handoff digest, and
+the work index behind the file, git, and plan extraction.
 """
 
 from __future__ import annotations
@@ -39,11 +39,20 @@ TOOLS = (
     "opencode",
     "qoder",
     "commandcode",
+    "grok",
+    "zcode",
 )
 ANY_TOOL = "any"
 SELECTABLE = TOOLS + (ANY_TOOL,)
-# Spellings a user is likely to type for a tool whose own name is hyphenated.
-TOOL_ALIASES = {"command-code": "commandcode", "cc": "commandcode"}
+# Spellings a user is likely to type for a tool whose own name is hyphenated,
+# or that ships under a two-word product name (`grok` calls itself Grok Build).
+TOOL_ALIASES = {
+    "command-code": "commandcode",
+    "cc": "commandcode",
+    "grok-build": "grok",
+    "grokbuild": "grok",
+    "z-code": "zcode",
+}
 UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -340,7 +349,9 @@ AGENT_INTERNAL_PARTS = {
     ".cursor",
     ".devin",
     ".git",
+    ".grok",
     ".opencode",
+    ".zcode",
     ".venv",
     "__pycache__",
     "node_modules",
@@ -1784,6 +1795,26 @@ def _opencode_db_paths() -> list[Path]:
     return output
 
 
+def _zcode_config_dir() -> Path:
+    """Return the zcode home directory; its CLI store lives under `cli/`."""
+    configured = os.environ.get("ZCODE_CONFIG_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".zcode"
+
+
+def _zcode_db_paths() -> list[Path]:
+    """Candidate zcode session databases.
+
+    zcode's CLI keeps OpenCode's storage schema - one SQLite file holding
+    `session`, `message`, and `part` rows with the message body in `part.data` -
+    in `~/.zcode/cli/db/db.sqlite`. The two stores differ only in which optional
+    columns the `session` table carries (zcode records `task_type` but not
+    `agent`/`model`), so both are read through the same functions, which probe
+    for the columns instead of assuming them.
+    """
+    path = _zcode_config_dir() / "cli" / "db" / "db.sqlite"
+    return [path] if path.is_file() and not path.is_symlink() else []
+
+
 def _opencode_model_id(model: Any) -> str | None:
     if not isinstance(model, str):
         return None
@@ -1801,20 +1832,62 @@ def _opencode_model_id(model: Any) -> str | None:
 def read_opencode_session(
     database_path: Path | str, session_id: str, max_tool_chars: int = 300
 ) -> dict[str, Any]:
+    return _read_opencode_schema_session(
+        database_path,
+        session_id,
+        max_tool_chars,
+        tool="opencode",
+        source="opencode",
+        label="OpenCode",
+    )
+
+
+def read_zcode_session(
+    database_path: Path | str, session_id: str, max_tool_chars: int = 300
+) -> dict[str, Any]:
+    return _read_opencode_schema_session(
+        database_path,
+        session_id,
+        max_tool_chars,
+        tool="zcode",
+        source="zcode-cli",
+        label="zcode",
+    )
+
+
+def _read_opencode_schema_session(
+    database_path: Path | str,
+    session_id: str,
+    max_tool_chars: int = 300,
+    *,
+    tool: str,
+    source: str,
+    label: str,
+) -> dict[str, Any]:
     database_path = Path(database_path).expanduser()
     warnings: list[dict[str, str]] = []
     turns: list[dict[str, Any]] = []
     index = WorkIndex()
     try:
         with _open_sqlite_readonly(database_path) as database:
+            columns = _table_columns(database, "session")
+            optional = [name for name in ("agent", "model") if name in columns]
             row = database.execute(
-                "SELECT directory, title, time_created, time_updated, agent, model "
-                "FROM session WHERE id = ?",
+                "SELECT directory, title, time_created, time_updated"
+                + "".join(f", {name}" for name in optional)
+                + " FROM session WHERE id = ?",
                 (session_id,),
             ).fetchone()
             if row is None:
-                raise ReaderError(f"no OpenCode session {session_id} in {database_path}")
-            directory, title, created_at, updated_at, agent, model = row
+                raise ReaderError(f"no {label} session {session_id} in {database_path}")
+            directory, title, created_at, updated_at = row[:4]
+            extra = dict(zip(optional, row[4:]))
+            agent = extra.get("agent")
+            model = extra.get("model")
+            # zcode's `session` table carries neither, so fall back to what the
+            # newest assistant message recorded for itself.
+            message_agent: str | None = None
+            message_model: str | None = None
             parts_by_message: dict[str, list[dict[str, Any]]] = {}
             part_rows = database.execute(
                 "SELECT message_id, data FROM part WHERE session_id = ? ORDER BY time_created",
@@ -1834,6 +1907,7 @@ def read_opencode_session(
                 (session_id,),
             ).fetchall()
             skipped = 0
+            synthetic = 0
             for message_id, raw in rows:
                 if not isinstance(message_id, str):
                     continue
@@ -1847,12 +1921,26 @@ def read_opencode_session(
                 role = message.get("role")
                 if role not in {"user", "assistant"}:
                     continue
+                if role == "assistant":
+                    named_agent = message.get("agent")
+                    if isinstance(named_agent, str) and named_agent:
+                        message_agent = named_agent
+                    named_model = message.get("modelID")
+                    if isinstance(named_model, str) and named_model:
+                        message_model = named_model
                 texts: list[str] = []
                 calls: list[dict[str, Any]] = []
                 results: list[dict[str, Any]] = []
                 for part in parts_by_message.get(message_id, []):
                     part_type = part.get("type")
                     if part_type == "text":
+                        if role == "user" and part.get("synthetic"):
+                            # The store flags text the harness wrote into the
+                            # conversation itself (mode preambles, "you have not
+                            # used TodoWrite lately" nudges). Nobody typed it, so
+                            # it must not read as a user request.
+                            synthetic += 1
+                            continue
                         text = part.get("text")
                         if isinstance(text, str) and text.strip():
                             texts.append(_safe_text(text))
@@ -1891,14 +1979,26 @@ def read_opencode_session(
                 _add_warning(
                     warnings,
                     "unsafe_records_skipped",
-                    f"Skipped {skipped} OpenCode reasoning/unknown part(s).",
+                    f"Skipped {skipped} {label} reasoning/unknown part(s).",
+                )
+            if synthetic:
+                _add_warning(
+                    warnings,
+                    "harness_text_dropped",
+                    f"Dropped {synthetic} harness-written {label} text part(s) that "
+                    "wore the user role.",
                 )
     except sqlite3.Error as exc:
-        raise ReaderError(f"failed to read OpenCode database {database_path}: {exc}") from exc
+        raise ReaderError(f"failed to read {label} database {database_path}: {exc}") from exc
+
+    if not isinstance(agent, str) or not agent:
+        agent = message_agent
+    if model is None:
+        model = message_model
 
     result = {
-        "tool": "opencode",
-        "source": "opencode",
+        "tool": tool,
+        "source": source,
         "session_id": session_id,
         "path": str(database_path),
         "title": _one_line(title, 200) if isinstance(title, str) else None,
@@ -1916,28 +2016,47 @@ def read_opencode_session(
 
 
 def _discover_opencode(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
+    return _discover_opencode_schema(
+        _opencode_db_paths(), "opencode", "opencode", cwd, within_min
+    )
+
+
+def _discover_zcode(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
+    return _discover_opencode_schema(
+        _zcode_db_paths(), "zcode", "zcode-cli", cwd, within_min
+    )
+
+
+def _discover_opencode_schema(
+    db_paths: list[Path], tool: str, source: str, cwd: str | None, within_min: int
+) -> list[dict[str, Any]]:
     sessions: list[dict[str, Any]] = []
-    for database_path in _opencode_db_paths():
+    for database_path in db_paths:
         try:
             with _open_sqlite_readonly(database_path) as database:
+                columns = _table_columns(database, "session")
+                optional = [
+                    name for name in ("agent", "model", "task_type") if name in columns
+                ]
                 rows = database.execute(
-                    "SELECT id, directory, title, time_created, time_updated, time_archived, "
-                    "agent, model FROM session "
-                    "WHERE COALESCE(time_archived, 0) = 0 ORDER BY time_updated DESC"
+                    "SELECT id, directory, title, time_created, time_updated"
+                    + "".join(f", {name}" for name in optional)
+                    + " FROM session WHERE COALESCE(time_archived, 0) = 0 "
+                    "ORDER BY time_updated DESC"
                 ).fetchall()
         except (ReaderError, sqlite3.Error):
             continue
-        for (
-            session_id,
-            directory,
-            title,
-            created_at,
-            updated_at,
-            time_archived,
-            agent,
-            model,
-        ) in rows:
+        for row in rows:
+            session_id, directory, title, created_at, updated_at = row[:5]
+            extra = dict(zip(optional, row[5:]))
             if not isinstance(session_id, str):
+                continue
+            task_type = extra.get("task_type")
+            # A subagent transcript is the parent session's own tool traffic
+            # rather than a session the user worked in, and zcode writes one per
+            # spawned agent. Keep them out of listings; a native id still reaches
+            # them.
+            if isinstance(task_type, str) and task_type.startswith("subagent"):
                 continue
             if cwd is not None:
                 if not isinstance(directory, str) or not _paths_match(directory, cwd):
@@ -1947,8 +2066,8 @@ def _discover_opencode(cwd: str | None, within_min: int) -> list[dict[str, Any]]
                 continue
             sessions.append(
                 {
-                    "tool": "opencode",
-                    "source": "opencode",
+                    "tool": tool,
+                    "source": source,
                     "session_id": session_id,
                     "path": str(database_path),
                     "title": _one_line(title, 200) if isinstance(title, str) else None,
@@ -1957,14 +2076,28 @@ def _discover_opencode(cwd: str | None, within_min: int) -> list[dict[str, Any]]
                     "updated_at_ms": updated,
                     "updated_at": _iso_from_millis(updated),
                     "source_repo_root_path": None,
-                    "model": _opencode_model_id(model),
+                    "model": _opencode_model_id(extra.get("model")),
                 }
             )
     return sessions
 
 
 def _find_opencode_id(session_id: str, cwd: str) -> dict[str, Any] | None:
-    for database_path in _opencode_db_paths():
+    return _find_opencode_schema_id(
+        _opencode_db_paths(), "opencode", "opencode", session_id, cwd
+    )
+
+
+def _find_zcode_id(session_id: str, cwd: str) -> dict[str, Any] | None:
+    return _find_opencode_schema_id(
+        _zcode_db_paths(), "zcode", "zcode-cli", session_id, cwd
+    )
+
+
+def _find_opencode_schema_id(
+    db_paths: list[Path], tool: str, source: str, session_id: str, cwd: str
+) -> dict[str, Any] | None:
+    for database_path in db_paths:
         try:
             with _open_sqlite_readonly(database_path) as database:
                 row = database.execute(
@@ -1976,8 +2109,8 @@ def _find_opencode_id(session_id: str, cwd: str) -> dict[str, Any] | None:
             directory, title, updated_at = row
             updated = _timestamp_to_millis(updated_at)
             return {
-                "tool": "opencode",
-                "source": "opencode",
+                "tool": tool,
+                "source": source,
                 "session_id": session_id,
                 "path": str(database_path),
                 "title": _one_line(title, 200) if isinstance(title, str) else None,
@@ -1988,6 +2121,382 @@ def _find_opencode_id(session_id: str, cwd: str) -> dict[str, Any] | None:
             }
         except (ReaderError, sqlite3.Error):
             continue
+    return None
+
+
+# ─── Grok ───────────────────────────────────────────────────────────────
+#
+# The Grok CLI (`grok`, "Grok Build") keeps one directory per session under
+# `~/.grok/sessions/<percent-encoded cwd>/<session-id>/`. Two files in it
+# matter:
+#
+#   chat_history.jsonl - the transcript: `system`, `user`, `assistant`,
+#                        `reasoning`, `tool_result`, `backend_tool_call`.
+#   summary.json       - working directory, timestamps, generated title,
+#                        model, git head, and whether the session is a subagent.
+#
+# An assistant record carries its `tool_calls` inline and the results arrive as
+# separate `tool_result` records keyed by `tool_call_id`, so each result is
+# attached to the call it answers. Records the harness wrote under the user role
+# carry a `synthetic_reason`; the one worth keeping is `compaction_meta`, which
+# is where the summary of turns the file no longer holds is stored.
+
+
+GROK_KNOWN_TYPES = {
+    "system",
+    "user",
+    "assistant",
+    "reasoning",
+    "tool_result",
+    "backend_tool_call",
+}
+# What the user actually typed is wrapped; the rest of a user record is
+# environment the harness prepended around it.
+GROK_USER_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.DOTALL)
+GROK_SUMMARY_RE = re.compile(
+    r"<summary_content>\s*(.*?)\s*</summary_content>", re.DOTALL
+)
+
+
+def _grok_config_dir() -> Path:
+    configured = os.environ.get("GROK_HOME") or os.environ.get("GROK_CONFIG_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".grok"
+
+
+def _grok_sessions_dir() -> Path:
+    return _grok_config_dir() / "sessions"
+
+
+def _grok_session_dir(path: Path) -> Path | None:
+    """Resolve a supplied path to the Grok session directory it names."""
+    if path.is_dir() and (path / "chat_history.jsonl").is_file():
+        return path
+    if path.is_file() and path.name in {"chat_history.jsonl", "summary.json"}:
+        parent = path.parent
+        if (parent / "chat_history.jsonl").is_file():
+            return parent
+    return None
+
+
+def _grok_summary(session_dir: Path) -> dict[str, Any]:
+    try:
+        with (session_dir / "summary.json").open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _grok_meta(session_dir: Path) -> dict[str, Any]:
+    """Extract listing metadata from a Grok session without rendering its turns."""
+    from urllib.parse import unquote
+
+    summary = _grok_summary(session_dir)
+    info = summary.get("info")
+    if not isinstance(info, dict):
+        info = {}
+    cwd = info.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        # The project directory is the working directory percent-encoded, so it
+        # still names the session's cwd when summary.json is missing.
+        cwd = unquote(session_dir.parent.name) or None
+    updated = _timestamp_to_millis(
+        summary.get("last_active_at") or summary.get("updated_at")
+    )
+    if updated is None:
+        updated = _mtime_millis(session_dir / "chat_history.jsonl")
+    session_id = info.get("id")
+    return {
+        "session_id": session_id if isinstance(session_id, str) else session_dir.name,
+        "cwd": cwd,
+        "branch": _first_string(summary, ("head_branch",)) or None,
+        "title": _one_line(
+            _first_string(summary, ("generated_title", "session_summary")), 200
+        )
+        or None,
+        "created_at_ms": _timestamp_to_millis(summary.get("created_at")),
+        "updated_at_ms": updated,
+        "session_kind": _first_string(summary, ("session_kind",)) or None,
+        "model": _first_string(summary, ("current_model_id",)) or None,
+        "agent": _first_string(summary, ("agent_name",)) or None,
+        "source_repo_root_path": _first_string(summary, ("git_root_dir",)) or None,
+    }
+
+
+def read_grok_session(path: Path | str, max_tool_chars: int = 300) -> dict[str, Any]:
+    raw_path = Path(path).expanduser()
+    session_dir = _grok_session_dir(raw_path)
+    if session_dir is None:
+        raise ReaderError(
+            f"{raw_path} is not a Grok session directory (no chat_history.jsonl in it)."
+        )
+    records, malformed = _read_plain_jsonl(session_dir / "chat_history.jsonl")
+    warnings: list[dict[str, str]] = []
+    if malformed:
+        _add_warning(
+            warnings,
+            "malformed_records_skipped",
+            f"Skipped {malformed} malformed Grok transcript record(s).",
+        )
+
+    index = WorkIndex()
+    turns: list[dict[str, Any]] = []
+    summaries: list[str] = []
+    dropped = 0
+    reasoning = 0
+    unknown = 0
+    attachments = 0
+    for record in records:
+        kind = record.get("type")
+        if kind == "user":
+            text = _content_text(record.get("content")).strip()
+            attachments += sum(
+                1 for block in _blocks(record.get("content")) if block.get("type") != "text"
+            )
+            reason = record.get("synthetic_reason")
+            if reason == "compaction_meta":
+                match = GROK_SUMMARY_RE.search(text)
+                if match:
+                    summaries.append(match.group(1))
+                dropped += 1
+                continue
+            if reason:
+                # skills, MCP announcements, background-task notices, injected
+                # project instructions: written by the harness, not the user.
+                dropped += 1
+                continue
+            queries = GROK_USER_QUERY_RE.findall(text)
+            if queries:
+                text = "\n\n".join(queries)
+            elif _is_generated_meta_text(text):
+                # `<user_info>`, `<system-reminder>`, `<image_files>`: the same
+                # environment text, in the builds that tag it with no reason.
+                dropped += 1
+                continue
+            if text:
+                turns.append(_turn("user", text=text))
+        elif kind == "assistant":
+            calls: list[dict[str, Any]] = []
+            for call in record.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                arguments = call.get("arguments")
+                index.record(call.get("name"), arguments)
+                calls.append(
+                    {
+                        "id": call.get("id"),
+                        "name": _safe_text(call.get("name") or "tool"),
+                        "input": _json_preview(arguments, max_tool_chars),
+                        "inert": True,
+                    }
+                )
+            turns.append(
+                _turn(
+                    "assistant",
+                    text=_content_text(record.get("content")),
+                    tool_calls=calls,
+                )
+            )
+        elif kind == "tool_result":
+            output = {
+                "tool_use_id": record.get("tool_call_id"),
+                "content": _one_line(_content_text(record.get("content")), max_tool_chars),
+                # Grok records no failure flag on a result, so none is claimed.
+                "is_error": False,
+                "unavailable": False,
+                "inert": True,
+            }
+            if turns and turns[-1]["role"] == "assistant":
+                turns[-1]["tool_results"].append(output)
+            else:
+                turns.append(_turn("user", tool_results=[output]))
+        elif kind == "backend_tool_call":
+            # A server-side tool (web search) the model invoked. It touches no
+            # file, so it is shown but not fed to the work index.
+            payload = record.get("kind")
+            payload = payload if isinstance(payload, dict) else {}
+            call = {
+                "id": None,
+                "name": _safe_text(payload.get("tool_type") or "backend_tool"),
+                "input": _json_preview(payload.get("action"), max_tool_chars),
+                "inert": True,
+            }
+            if turns and turns[-1]["role"] == "assistant":
+                turns[-1]["tool_calls"].append(call)
+            else:
+                turns.append(_turn("assistant", tool_calls=[call]))
+        elif kind == "reasoning":
+            reasoning += 1
+        elif kind == "system":
+            # The base instructions the harness sent, never part of a handoff.
+            continue
+        else:
+            unknown += 1
+
+    prior_context: dict[str, Any] | None = None
+    if summaries:
+        _add_warning(
+            warnings,
+            "history_compacted",
+            f"This transcript was auto-compacted: {len(summaries)} summary record(s) "
+            "stand in for earlier turns that are not in this file. The summary is "
+            "reported as prior context and is the previous agent's account, not "
+            "verified state.",
+        )
+        text = "\n\n".join(summaries)
+        prior_context = {
+            "source": "auto-compaction summary",
+            "text": _safe_text(text[:PRIOR_CONTEXT_CHARS]),
+            "truncated": len(text) > PRIOR_CONTEXT_CHARS,
+        }
+    if dropped:
+        _add_warning(
+            warnings,
+            "harness_text_dropped",
+            f"Dropped {dropped} harness-written record(s) that wore the user role "
+            "(environment preamble, skill and MCP announcements, background-task "
+            "notices).",
+        )
+    if reasoning:
+        _add_warning(
+            warnings,
+            "unsafe_records_skipped",
+            f"Skipped {reasoning} Grok reasoning record(s); their content is "
+            "encrypted and is never rendered.",
+        )
+    if attachments:
+        _add_warning(
+            warnings,
+            "attachments_skipped",
+            f"{attachments} non-text attachment block(s) (images) in user messages "
+            "were not recovered.",
+        )
+    if unknown:
+        _add_warning(
+            warnings,
+            "unknown_records_skipped",
+            f"Skipped {unknown} unknown Grok record(s) without interpreting their "
+            "payloads.",
+        )
+
+    meta = _grok_meta(session_dir)
+    if str(meta.get("session_kind") or "").startswith("subagent"):
+        _add_warning(
+            warnings,
+            "subagent_session",
+            "This is a subagent transcript: the work was driven by another Grok "
+            "session, so its first message is a task assignment rather than "
+            "something the user typed.",
+        )
+    title = meta.get("title")
+    if not title:
+        title = next(
+            (turn["text"] for turn in turns if turn["role"] == "user" and turn["text"]),
+            None,
+        )
+    result = {
+        "tool": "grok",
+        "source": "grok-cli",
+        "session_id": meta.get("session_id") or session_dir.name,
+        "path": str(session_dir),
+        "title": _one_line(title, 200) or None,
+        "cwd": meta.get("cwd"),
+        "branch": meta.get("branch"),
+        "created_at": _iso_from_millis(meta.get("created_at_ms")),
+        "updated_at": _iso_from_millis(meta.get("updated_at_ms")),
+        "source_repo_root_path": meta.get("source_repo_root_path"),
+        "prior_context": prior_context,
+        "turns": turns,
+        "warnings": warnings,
+    }
+    if meta.get("model"):
+        result["model"] = meta["model"]
+    if meta.get("agent"):
+        result["agent"] = meta["agent"]
+    return _finalize_result(result, index)
+
+
+def _discover_grok(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
+    from urllib.parse import quote
+
+    root = _grok_sessions_dir()
+    if not root.is_dir() or root.is_symlink():
+        return []
+    expected = root / quote(cwd, safe="") if cwd else None
+    project_dirs: list[Path] = []
+    if expected is not None and expected.is_dir() and not expected.is_symlink():
+        project_dirs.append(expected)
+    try:
+        project_dirs.extend(
+            path
+            for path in sorted(root.iterdir(), key=lambda item: item.name)
+            if path != expected and path.is_dir() and not path.is_symlink()
+        )
+    except OSError:
+        pass
+    sessions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for project in project_dirs:
+        try:
+            paths = sorted(project.iterdir(), key=lambda item: item.name)
+        except OSError:
+            continue
+        for path in paths:
+            if path.is_symlink() or not path.is_dir():
+                continue
+            transcript = path / "chat_history.jsonl"
+            try:
+                # A session Grok opened but never used holds no transcript at
+                # all; listing it would let `show latest` return an empty handoff.
+                if not transcript.is_file() or transcript.stat().st_size == 0:
+                    continue
+            except OSError:
+                continue
+            meta = _grok_meta(path)
+            session_id = str(meta.get("session_id") or path.name)
+            if session_id in seen:
+                continue
+            if str(meta.get("session_kind") or "").startswith("subagent"):
+                continue
+            updated = int(meta.get("updated_at_ms") or 0)
+            if not _within(updated, within_min):
+                continue
+            if cwd is not None:
+                if meta.get("cwd") and not _paths_match(str(meta["cwd"]), cwd):
+                    continue
+                if not meta.get("cwd") and project != expected:
+                    continue
+            seen.add(session_id)
+            sessions.append(
+                {
+                    "tool": "grok",
+                    "source": "grok-cli",
+                    "session_id": session_id,
+                    "path": str(path),
+                    "title": meta.get("title") or "(untitled)",
+                    "cwd": meta.get("cwd") or cwd,
+                    "branch": meta.get("branch"),
+                    "updated_at_ms": updated,
+                    "updated_at": _iso_from_millis(updated),
+                    "source_repo_root_path": meta.get("source_repo_root_path"),
+                    "model": meta.get("model"),
+                }
+            )
+    return sessions
+
+
+def _find_grok_id(session_id: str, cwd: str) -> dict[str, Any] | None:
+    from urllib.parse import quote
+
+    root = _grok_sessions_dir()
+    if not root.is_dir():
+        return None
+    candidates = [root / quote(cwd, safe="") / session_id]
+    candidates.extend(sorted(root.glob(f"*/{session_id}"), key=str))
+    for path in candidates:
+        candidate = _candidate_from_path("grok", str(path), cwd)
+        if candidate is not None:
+            return candidate
     return None
 
 
@@ -4028,6 +4537,8 @@ CURRENT_SESSION_ENV = (
     "QODER_SESSION_ID",
     "COMMANDCODE_SESSION_ID",
     "COMMAND_CODE_SESSION_ID",
+    "GROK_SESSION_ID",
+    "ZCODE_SESSION_ID",
 )
 
 
@@ -4106,6 +4617,10 @@ def discover_sessions(
         sessions = _discover_qoder(requested_cwd, within_min)
     elif tool == "commandcode":
         sessions = _discover_commandcode(requested_cwd, within_min)
+    elif tool == "grok":
+        sessions = _discover_grok(requested_cwd, within_min)
+    elif tool == "zcode":
+        sessions = _discover_zcode(requested_cwd, within_min)
     else:
         sessions = _discover_cursor_cli(requested_cwd, within_min)
         sessions.extend(_discover_cursor_desktop(requested_cwd, within_min))
@@ -4132,6 +4647,24 @@ def _candidate_from_path(tool: str, raw_path: str, cwd: str) -> dict[str, Any] |
         return None
     if tool != "commandcode" and _under(path, _commandcode_config_dir()):
         return None
+    # Grok's transcript is a `.jsonl` too, so the same rule keeps the Claude and
+    # Cursor matchers below from claiming a path inside Grok's store.
+    if tool != "grok" and _under(path, _grok_config_dir()):
+        return None
+    if tool == "grok":
+        session_dir = _grok_session_dir(path)
+        if session_dir is None:
+            return None
+        meta = _grok_meta(session_dir)
+        return {
+            "tool": tool,
+            "source": "grok-cli",
+            "session_id": meta.get("session_id") or session_dir.name,
+            "path": str(session_dir),
+            "title": meta.get("title"),
+            "cwd": meta.get("cwd") or cwd,
+            "updated_at_ms": int(meta.get("updated_at_ms") or updated),
+        }
     if (
         tool == "commandcode"
         and path.is_file()
@@ -4386,6 +4919,8 @@ def _finders() -> dict[str, Any]:
         "opencode": _find_opencode_id,
         "qoder": _find_qoder_id,
         "commandcode": _find_commandcode_id,
+        "grok": _find_grok_id,
+        "zcode": _find_zcode_id,
     }
 
 
@@ -4432,7 +4967,12 @@ def resolve_session(
     if len(exact) == 1:
         return exact[0]
     uuid_ref = ref[2:] if ref.startswith("T-") else ref
-    if UUID_RE.fullmatch(ref) or UUID_RE.fullmatch(uuid_ref) or ref.startswith("ses_"):
+    # `ses_` is OpenCode's session id prefix, `sess_` zcode's.
+    if (
+        UUID_RE.fullmatch(ref)
+        or UUID_RE.fullmatch(uuid_ref)
+        or ref.startswith(("ses_", "sess_"))
+    ):
         finders = _finders()
         for name in TOOLS if tool == ANY_TOOL else (tool,):
             try:
@@ -4477,6 +5017,10 @@ def read_resolved_session(
         return read_commandcode_session(
             candidate["path"], max_tool_chars, cwd_hint=candidate.get("cwd")
         )
+    if tool == "grok":
+        return read_grok_session(candidate["path"], max_tool_chars)
+    if tool == "zcode":
+        return read_zcode_session(candidate["path"], candidate["session_id"], max_tool_chars)
     return read_cursor_session(candidate, max_tool_chars)
 
 
