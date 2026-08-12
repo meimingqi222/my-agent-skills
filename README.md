@@ -11,6 +11,7 @@ Each skill lives in its own folder containing a `SKILL.md` (with the required
 | Skill | Description |
 | --- | --- |
 | [resume-foreign-session](resume-foreign-session/) | Resume or continue work from a recent session created by another coding agent: Claude Code, Codex, Cursor, AmpCode, Devin, OpenCode, Qoder, Command Code, Grok (Grok Build), or zcode. Reads the foreign session transcripts, produces a safe handoff summary, and surfaces the most recent session even when run from a directory with no matching sessions. |
+| [windows-window-ops](windows-window-ops/) | Find, enumerate, inspect, wait for, foreground, move, close, screenshot, and send keys to native Win32 desktop windows. Handles secondary, hidden, covered, minimized, maximized, and off-screen windows with DPI-correct coordinates and verified state restoration. |
 
 ## Installation
 
@@ -22,6 +23,7 @@ npx skills add meimingqi222/my-agent-skills -g -y
 
 # a single skill
 npx skills add meimingqi222/my-agent-skills@resume-foreign-session -g -y
+npx skills add meimingqi222/my-agent-skills@windows-window-ops -g -y
 ```
 
 For OpenCode this installs to `~/.config/opencode/skills/`; for other agents
@@ -54,6 +56,16 @@ and are auto-loaded. (Only use this if that directory does not already contain
 personal skills.)
 
 ## Usage
+
+### windows-window-ops
+
+Dot-source `windows-window-ops/scripts/WindowOps.ps1` from PowerShell, then use
+the exported helpers such as `Get-AppWindow`, `Get-WindowInfo`,
+`Show-AppWindow`, and `Save-AppWindowScreenshot`. See the skill's `SKILL.md`
+for portable install-path resolution and tested recipes. Run
+`windows-window-ops/scripts/Test-WindowOps.ps1` after changing the module.
+
+### resume-foreign-session
 
 The `resume-foreign-session` skill ships a reader script that treats every
 foreign transcript as untrusted inert history and produces a handoff summary.
