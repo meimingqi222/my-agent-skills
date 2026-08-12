@@ -16,24 +16,61 @@ function Assert-WinOpsTest {
     if (-not $Condition) { throw "ASSERTION FAILED: $Message" }
 }
 
+function Test-WinOpsBitmapContainsColor {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][int]$Red,
+        [Parameter(Mandatory)][int]$Green,
+        [Parameter(Mandatory)][int]$Blue,
+        [int]$Tolerance = 20
+    )
+    $bitmap = [Drawing.Bitmap]::FromFile($Path)
+    try {
+        for ($y = 0; $y -lt $bitmap.Height; $y += 3) {
+            for ($x = 0; $x -lt $bitmap.Width; $x += 3) {
+                $pixel = $bitmap.GetPixel($x, $y)
+                if ([Math]::Abs($pixel.R - $Red) -le $Tolerance -and
+                    [Math]::Abs($pixel.G - $Green) -le $Tolerance -and
+                    [Math]::Abs($pixel.B - $Blue) -le $Tolerance) {
+                    return $true
+                }
+            }
+        }
+        return $false
+    }
+    finally { $bitmap.Dispose() }
+}
+
 function Start-WinOpsTestForm {
     param(
         [Parameter(Mandatory)][string]$Title,
         [string]$Color = "White",
         [switch]$SecondaryWindow,
-        [switch]$TextBox
+        [switch]$TextBox,
+        [switch]$DpiAwareMarkers
     )
+    $dpiCode = if ($DpiAwareMarkers) {
+        @'
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class WinOpsTestDpi { [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value); }'
+[WinOpsTestDpi]::SetThreadDpiAwarenessContext([IntPtr](-4)) | Out-Null
+'@
+    } else { "" }
     $secondaryCode = if ($SecondaryWindow) {
         "`$second=[Windows.Forms.Form]::new();`$second.Text='$Title Secondary';`$second.Size=[Drawing.Size]::new(420,280);`$form.Add_Shown({`$second.Show()})"
     } else { "" }
     $textBoxCode = if ($TextBox) {
         "`$box=[Windows.Forms.TextBox]::new();`$box.Dock='Fill';`$form.Controls.Add(`$box);`$box.Add_TextChanged({`$form.Text='$Title Text:' + `$box.Text});`$form.Add_Shown({`$box.Focus()});`$form.Add_Activated({`$box.Focus()})"
     } else { "" }
+    $markerCode = if ($DpiAwareMarkers) {
+        "`$left=[Windows.Forms.Panel]::new();`$left.Location=[Drawing.Point]::new(100,100);`$left.Size=[Drawing.Size]::new(80,400);`$left.BackColor=[Drawing.Color]::Red;`$form.Controls.Add(`$left);`$right=[Windows.Forms.Panel]::new();`$right.Location=[Drawing.Point]::new(720,100);`$right.Size=[Drawing.Size]::new(80,400);`$right.BackColor=[Drawing.Color]::Lime;`$form.Controls.Add(`$right)"
+    } else { "" }
     $source = @"
+$dpiCode
 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
-`$form=[Windows.Forms.Form]::new();`$form.Text='$Title';`$form.Size=[Drawing.Size]::new(600,400);`$form.BackColor=[Drawing.Color]::$Color
+`$form=[Windows.Forms.Form]::new();`$form.Text='$Title';`$form.Size=[Drawing.Size]::new($(if ($DpiAwareMarkers) { 900 } else { 600 }),$(if ($DpiAwareMarkers) { 600 } else { 400 }));`$form.BackColor=[Drawing.Color]::$Color
 $secondaryCode
 $textBoxCode
+$markerCode
 [Windows.Forms.Application]::Run(`$form)
 "@
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($source))
@@ -64,6 +101,16 @@ try {
     Assert-WinOpsTest ($beforeDpi.Dpi -gt 0) "Window DPI was not reported."
     $results.Add([PSCustomObject]@{ Test = "StablePhysicalDpiCoordinates"; Passed = $true; Dpi = $beforeDpi.Dpi })
 
+    $dpiFixture = Start-WinOpsTestForm -Title "WindowOps DPI $tag" -Color White -DpiAwareMarkers
+    $processes.Add($dpiFixture.Process)
+    $dpiInfo = Get-WindowInfo -Handle $dpiFixture.Window.Handle
+    $dpiPath = Join-Path $OutputDirectory "dpi-aware.png"
+    $dpiCapture = Save-AppWindowScreenshot -Handle $dpiFixture.Window.Handle -Path $dpiPath -CaptureMode PrintWindow -PassThru
+    Assert-WinOpsTest ($dpiCapture.Width -eq $dpiInfo.VisibleWidth -and $dpiCapture.Height -eq $dpiInfo.VisibleHeight) "DPI-aware PrintWindow capture dimensions did not match the visible frame."
+    Assert-WinOpsTest (Test-WinOpsBitmapContainsColor -Path $dpiPath -Red 255 -Green 0 -Blue 0) "DPI-aware capture lost the left edge marker."
+    Assert-WinOpsTest (Test-WinOpsBitmapContainsColor -Path $dpiPath -Red 0 -Green 255 -Blue 0) "DPI-aware capture lost the right edge marker; the capture host may be DPI-virtualized."
+    $results.Add([PSCustomObject]@{ Test = "DpiAwarePrintWindowCompleteness"; Passed = $true; Dpi = $dpiInfo.Dpi; Size = "$($dpiCapture.Width)x$($dpiCapture.Height)" })
+
     $uniform = Start-WinOpsTestForm -Title "WindowOps Uniform $tag" -Color White
     $processes.Add($uniform.Process)
     $uniformCapture = Save-AppWindowScreenshot -Handle $uniform.Window.Handle -Path (Join-Path $OutputDirectory "uniform.png") -PassThru
@@ -86,6 +133,14 @@ try {
     Show-AppWindow -Handle $uniform.Window.Handle -Mode Maximize
     Wait-AppWindowState -Handle $uniform.Window.Handle -State Maximized -TimeoutSeconds 3 | Out-Null
     $maxInfo = Get-WindowInfo -Handle $uniform.Window.Handle
+    $maxMonitor = [WinOpsNative]::MonitorFromWindow($uniform.Window.Handle, $script:MONITOR_DEFAULTTONEAREST)
+    $maxMonitorInfo = New-Object WinOpsMonitorInfo
+    $maxMonitorInfo.Size = [Runtime.InteropServices.Marshal]::SizeOf([type][WinOpsMonitorInfo])
+    Assert-WinOpsTest ([WinOpsNative]::GetMonitorInfo($maxMonitor, [ref]$maxMonitorInfo)) "Could not inspect the maximized window's monitor."
+    Assert-WinOpsTest ($maxInfo.VisibleLeft -ge $maxMonitorInfo.Work.Left -and
+        $maxInfo.VisibleTop -ge $maxMonitorInfo.Work.Top -and
+        $maxInfo.VisibleLeft + $maxInfo.VisibleWidth -le $maxMonitorInfo.Work.Right -and
+        $maxInfo.VisibleTop + $maxInfo.VisibleHeight -le $maxMonitorInfo.Work.Bottom) "Maximized visible bounds extended outside the monitor work area."
     $maxCapture = Save-AppWindowScreenshot -Handle $uniform.Window.Handle -Path (Join-Path $OutputDirectory "maximized.png") -CaptureMode Screen -PassThru
     Assert-WinOpsTest ($maxCapture.Width -eq $maxInfo.VisibleWidth -and $maxCapture.Height -eq $maxInfo.VisibleHeight) "Maximized capture did not use DWM visible bounds."
     Assert-WinOpsTest ((Get-WindowInfo -Handle $uniform.Window.Handle).IsMaximized) "Maximized state was not preserved."
@@ -113,7 +168,7 @@ try {
 
     $keys = Start-WinOpsTestForm -Title "WindowOps Keys $tag" -Color Beige -TextBox
     $processes.Add($keys.Process)
-    Send-AppKeys -Handle $keys.Window.Handle -Keys "abc"
+    Send-AppKeys -Handle $keys.Window.Handle -Keys "abc" -FocusWaitMilliseconds 300
     $typed = Get-AppWindow -ProcessId $keys.Process.Id -TitleLike "WindowOps Keys $tag Text:abc" -TimeoutSeconds 3
     Assert-WinOpsTest ($null -ne $typed) "Send-AppKeys did not reach the target text box."
     $results.Add([PSCustomObject]@{ Test = "VerifiedSendKeys"; Passed = $true })

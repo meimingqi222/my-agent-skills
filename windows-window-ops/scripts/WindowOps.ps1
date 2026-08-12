@@ -23,11 +23,19 @@ using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Text;
 
-// Native ABI v0.5.0. Changing this source automatically rotates the cached assembly.
+// Native ABI v0.6.1. Changing this source automatically rotates the cached assembly.
 public delegate bool WinOpsEnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
 public struct WinOpsRect { public int Left; public int Top; public int Right; public int Bottom; }
 public struct WinOpsPoint { public int X; public int Y; }
+
+[StructLayout(LayoutKind.Sequential)]
+public struct WinOpsMonitorInfo {
+    public int Size;
+    public WinOpsRect Monitor;
+    public WinOpsRect Work;
+    public uint Flags;
+}
 
 [StructLayout(LayoutKind.Sequential)]
 public struct WinOpsWindowPlacement {
@@ -50,12 +58,15 @@ public class WinOpsNative {
     [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WinOpsWindowPlacement lpwndpl);
     [DllImport("user32.dll")] public static extern bool SetWindowPlacement(IntPtr hWnd, ref WinOpsWindowPlacement lpwndpl);
     [DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
+    [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint dwFlags);
+    [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr hMonitor, ref WinOpsMonitorInfo lpmi);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+    [DllImport("user32.dll")] public static extern IntPtr GetWindowDpiAwarenessContext(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
@@ -172,10 +183,18 @@ internal static class WinOpsCaptureHost {
     [DllImport("gdi32.dll")] private static extern IntPtr SelectObject(IntPtr hdc, IntPtr obj);
     [DllImport("gdi32.dll")] private static extern bool DeleteObject(IntPtr obj);
     [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr hdc);
+    [DllImport("user32.dll")] private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindowDpiAwarenessContext(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
 
     [STAThread]
     private static int Main() {
         IntPtr window = new IntPtr(long.Parse(Environment.GetEnvironmentVariable("WINOPS_HANDLE")));
+        try {
+            IntPtr targetContext = GetWindowDpiAwarenessContext(window);
+            SetThreadDpiAwarenessContext(targetContext == IntPtr.Zero ? new IntPtr(-4) : targetContext);
+        }
+        catch (EntryPointNotFoundException) { SetProcessDPIAware(); }
         string output = Environment.GetEnvironmentVariable("WINOPS_OUTPUT");
         int width = int.Parse(Environment.GetEnvironmentVariable("WINOPS_WIDTH"));
         int height = int.Parse(Environment.GetEnvironmentVariable("WINOPS_HEIGHT"));
@@ -246,6 +265,7 @@ $script:SM_YVIRTUALSCREEN = 77
 $script:SM_CXVIRTUALSCREEN = 78
 $script:SM_CYVIRTUALSCREEN = 79
 $script:DWMWA_EXTENDED_FRAME_BOUNDS = 9
+$script:MONITOR_DEFAULTTONEAREST = 2
 $script:DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = [IntPtr](-4)
 
 function Set-WinOpsDpiContext {
@@ -615,6 +635,24 @@ function Get-WinOpsWindowRect {
             $rectSize
         )
         if ($dwmResult -eq 0 -and $rect.Right -gt $rect.Left -and $rect.Bottom -gt $rect.Top) {
+            # Chromium/Electron and some WinUI windows keep their maximized resize
+            # frame outside the monitor. DWM can return those negative/invisible
+            # margins as part of EXTENDED_FRAME_BOUNDS. Clamp only maximized windows
+            # to their monitor work area so screen capture does not include adjacent
+            # monitor pixels, the taskbar, or off-screen black bands.
+            if ([WinOpsNative]::IsZoomed($Handle)) {
+                $monitor = [WinOpsNative]::MonitorFromWindow($Handle, $script:MONITOR_DEFAULTTONEAREST)
+                if ($monitor -ne [IntPtr]::Zero) {
+                    $monitorInfo = New-Object WinOpsMonitorInfo
+                    $monitorInfo.Size = [Runtime.InteropServices.Marshal]::SizeOf([type][WinOpsMonitorInfo])
+                    if ([WinOpsNative]::GetMonitorInfo($monitor, [ref]$monitorInfo)) {
+                        $rect.Left = [Math]::Max($rect.Left, $monitorInfo.Work.Left)
+                        $rect.Top = [Math]::Max($rect.Top, $monitorInfo.Work.Top)
+                        $rect.Right = [Math]::Min($rect.Right, $monitorInfo.Work.Right)
+                        $rect.Bottom = [Math]::Min($rect.Bottom, $monitorInfo.Work.Bottom)
+                    }
+                }
+            }
             return $rect
         }
     }
@@ -637,8 +675,17 @@ function Invoke-WinOpsPrintWindowCapture {
     $childSource = @'
 Add-Type -AssemblyName System.Drawing -ErrorAction Stop
 Add-Type -Path $env:WINOPS_NATIVE_ASSEMBLY -ErrorAction Stop
+$windowHandle = [IntPtr]([int64]$env:WINOPS_HANDLE)
+try {
+    $targetContext = [WinOpsNative]::GetWindowDpiAwarenessContext($windowHandle)
+    if ($targetContext -eq [IntPtr]::Zero) { $targetContext = [IntPtr](-4) }
+    [WinOpsNative]::SetThreadDpiAwarenessContext($targetContext) | Out-Null
+}
+catch [EntryPointNotFoundException] {
+    [WinOpsNative]::SetProcessDPIAware() | Out-Null
+}
 $ok = [WinOpsNative]::CapturePrintWindowPng(
-    [IntPtr]([int64]$env:WINOPS_HANDLE),
+    $windowHandle,
     $env:WINOPS_OUTPUT,
     [int]$env:WINOPS_WIDTH,
     [int]$env:WINOPS_HEIGHT,

@@ -5,7 +5,7 @@ description: Find, enumerate, inspect, wait for, foreground, move, close, screen
 
 # Windows window operations
 
-Version 0.6.0
+Version 0.6.1
 
 A tested PowerShell module (`scripts/WindowOps.ps1`) wrapping the Win32 APIs for finding
 and controlling native windows — desktop apps (Wails/Electron/etc.), not browser tabs.
@@ -86,7 +86,9 @@ claim success from the PowerShell exit code alone.
   to force that reliable path when an app returns a plausible-looking but stale backing layer.
 - **`PrintWindow` can block inside another process.** It runs in a small disposable capture
   host with a 1500 ms default timeout. Adjust `-PrintWindowTimeoutMilliseconds` for unusually
-  slow applications; Auto mode falls back to screen capture after a timeout.
+  slow applications; Auto mode falls back to screen capture after a timeout. The capture host
+  adopts the target window's DPI-awareness context before rendering; forcing one global DPI
+  mode truncates either modern Per-Monitor V2 windows or legacy DPI-unaware windows.
 - **Foreground focus doesn't survive across separate tool calls.** Each `PowerShell` tool
   invocation can itself steal focus back (e.g. this terminal). `Save-AppWindowScreenshot
   -Foreground` and `Send-AppKeys` foreground-then-act in one call for this reason — if you
