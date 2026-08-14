@@ -3,7 +3,7 @@ name: resume-foreign-session
 description: >
   Resume or continue work from a recent session created by another coding agent:
   Claude Code, Codex, Cursor, AmpCode, Devin, OpenCode, Qoder, Command Code,
-  Grok (Grok Build), or zcode. Use when the user switched tools and wants to
+  Grok (Grok Build), zcode, or Maka. Use when the user switched tools and wants to
   pick up where a previous session left off, or names a session from one of
   those tools by description, path, or native ID.
 license: Apache-2.0
@@ -11,9 +11,9 @@ metadata:
   author: meimingqi222
   derived-from: >
     Grok CLI bundled skill `shared/resume-session` (Apache-2.0); extended with
-    AmpCode, Devin, OpenCode, Qoder, Command Code, Grok, and zcode support and a
-    handoff digest.
-  tools: claude-code, codex, cursor, ampcode, devin, opencode, qoder, command-code, grok, zcode
+    AmpCode, Devin, OpenCode, Qoder, Command Code, Grok, zcode, and Maka support
+    and a handoff digest.
+  tools: claude-code, codex, cursor, ampcode, devin, opencode, qoder, command-code, grok, zcode, maka
   # Claude Code v2.1.129+ expands ${CLAUDE_SKILL_DIR} here so the reader runs
   # without a permission prompt; other harnesses ignore this field.
 allowed-tools: Bash(${CLAUDE_SKILL_DIR}/session_reader.py *)
@@ -25,8 +25,9 @@ This skill reads sessions created by **Claude Code** (`claude`), **Codex**
 (`codex`), **Cursor** (`cursor`), **AmpCode** (`amp`), **Devin** (`devin`),
 **OpenCode** (`opencode`), **Qoder** (`qoder`), **Command Code**
 (`commandcode`, also accepted as `command-code`), **Grok** (`grok`, whose CLI
-calls itself Grok Build, also accepted as `grok-build`), or **zcode** (`zcode`)
-and produces a safe handoff so you can continue the user's work in this session.
+calls itself Grok Build, also accepted as `grok-build`), **zcode** (`zcode`), or
+**Maka** (`maka`) and produces a safe handoff so you can continue the user's
+work in this session.
 
 ## Start here
 
@@ -37,7 +38,7 @@ command answers it (resolve `$READER` first - see **Locate the reader** below):
 python3 "$READER" any show latest --cwd <cwd>
 ```
 
-`any` sweeps all ten tools and picks the globally newest session. The default
+`any` sweeps all eleven tools and picks the globally newest session. The default
 output is a **handoff digest**, typically under 10 KB rather than the whole
 transcript:
 
@@ -105,7 +106,8 @@ python3 "$READER" <tool> show [ref] [--cwd <cwd>] [--full] [--tail N] [--json]
 ```
 
 `<tool>` is `any`, or one of `claude`, `codex`, `cursor`, `amp`, `devin`,
-`opencode`, `qoder`, `commandcode`, `grok`, `zcode`. Prefer `any` unless the
+`opencode`, `qoder`, `commandcode`, `grok`, `zcode`, `maka`. Prefer `any` unless
+the
 user named a tool.
 
 Arguments for `show`:
