@@ -24,7 +24,9 @@ from readers.cursor import read_cursor_session
 from readers.devin import read_devin_cli_session, read_devin_next_session
 from readers.grok import read_grok_session
 from readers.maka import read_maka_session
-from readers.opencode import read_opencode_session, read_zcode_session
+from readers.opencode import read_opencode_session, read_opencode2_session, read_zcode_session
+from readers.pi import read_pi_session
+from readers.dsh import read_dsh_session
 from readers.qoder import read_qoder_session
 
 
@@ -313,6 +315,293 @@ class TestSessionReaderSuite(unittest.TestCase):
             res_z = read_zcode_session(db_path, "ses_1")
             self.assertEqual(res_z["tool"], "zcode")
             self.assertEqual(len(res_z["turns"]), 2)
+        finally:
+            gc.collect()
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_opencode2_reader(self):
+        """Test opencode v2 reader (session_v2 + session_message schema)."""
+        td = tempfile.mkdtemp()
+        try:
+            db_path = Path(td) / "opencode.db"
+            conn = sqlite3.connect(db_path)
+            # v2 schema: session_v2 + session_message + todo
+            conn.execute(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, "
+                "title TEXT, time_created INTEGER, time_updated INTEGER, "
+                "time_archived INTEGER, agent TEXT, model TEXT, parent_id TEXT, "
+                "version TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, "
+                "type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, "
+                "data TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE todo (session_id TEXT, content TEXT, status TEXT, "
+                "priority TEXT, position INTEGER, time_created INTEGER, time_updated INTEGER)"
+            )
+            conn.execute(
+                "INSERT INTO session_v2 VALUES ('ses_v2_1', ?, 'V2 Title', 1000, 2000, "
+                "NULL, 'build', '{\"id\":\"test-model\",\"providerID\":\"opencode\"}', NULL, '0.0.0-beta')",
+                (td,)
+            )
+            # user message: text at top level
+            msg1_data = json.dumps({"time": {"created": 1000}, "text": "v2 user query"})
+            # assistant message: content array with text + tool parts
+            msg2_data = json.dumps({
+                "time": {"created": 2000, "completed": 2001},
+                "agent": "build",
+                "model": {"id": "test-model", "providerID": "opencode"},
+                "content": [
+                    {"type": "text", "text": "v2 assistant reply"},
+                    {
+                        "type": "tool",
+                        "id": "call_1",
+                        "name": "edit",
+                        "state": {
+                            "status": "completed",
+                            "input": {"path": "src/main.rs", "oldString": "old", "newString": "new"},
+                            "content": [{"type": "text", "text": "File updated"}],
+                        },
+                    },
+                ],
+            })
+            conn.execute("INSERT INTO session_message VALUES ('m1', 'ses_v2_1', 'user', 0, 1000, 1000, ?)", (msg1_data,))
+            conn.execute("INSERT INTO session_message VALUES ('m2', 'ses_v2_1', 'assistant', 1, 2000, 2001, ?)", (msg2_data,))
+            # todo entry
+            conn.execute("INSERT INTO todo VALUES ('ses_v2_1', 'Fix bug', 'completed', 'high', 0, 1000, 1000)")
+            conn.commit()
+            conn.close()
+
+            res = read_opencode2_session(db_path, "ses_v2_1")
+            self.assertEqual(res["tool"], "opencode2")
+            self.assertEqual(res["source"], "opencode-v2")
+            self.assertEqual(res["session_id"], "ses_v2_1")
+            self.assertEqual(res["title"], "V2 Title")
+            self.assertEqual(res["cwd"], td)
+            self.assertEqual(res["model"], "test-model")
+            self.assertEqual(res["agent"], "build")
+            # 2 turns: user + assistant
+            self.assertEqual(len(res["turns"]), 2)
+            # user turn
+            self.assertEqual(res["turns"][0]["role"], "user")
+            self.assertIn("v2 user query", res["turns"][0]["text"])
+            # assistant turn with tool call
+            self.assertEqual(res["turns"][1]["role"], "assistant")
+            self.assertIn("v2 assistant reply", res["turns"][1]["text"])
+            self.assertEqual(len(res["turns"][1]["tool_calls"]), 1)
+            self.assertEqual(res["turns"][1]["tool_calls"][0]["name"], "edit")
+            # tool result extracted from state.content
+            self.assertEqual(len(res["turns"][1]["tool_results"]), 1)
+            self.assertIn("File updated", res["turns"][1]["tool_results"][0]["content"])
+            # files touched via WorkIndex
+            files = res.get("files_touched", [])
+            self.assertTrue(any("src/main.rs" in f.get("path", "") for f in files))
+            # plan state from todo table
+            plan = res.get("plan_state")
+            self.assertIsNotNone(plan)
+            self.assertTrue(any("Fix bug" in item.get("label", "") for item in plan["items"]))
+            # digest renders
+            digest = sr.build_digest(res)
+            self.assertGreaterEqual(digest["turns_total"], 2)
+            rendered = sr.render_digest(res)
+            self.assertIn("V2 Title", rendered)
+        finally:
+            gc.collect()
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_opencode2_reader_error_and_compaction(self):
+        """Test opencode v2 reader handles error states and compaction markers."""
+        td = tempfile.mkdtemp()
+        try:
+            db_path = Path(td) / "opencode.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT, "
+                "title TEXT, time_created INTEGER, time_updated INTEGER, "
+                "time_archived INTEGER, agent TEXT, model TEXT, parent_id TEXT, "
+                "version TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, "
+                "type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, "
+                "data TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO session_v2 VALUES ('ses_v2_2', ?, 'Error Test', 1000, 2000, "
+                "NULL, 'build', NULL, NULL, '0.0.0-beta')",
+                (td,)
+            )
+            # user message
+            msg1 = json.dumps({"time": {"created": 1000}, "text": "do something"})
+            # assistant with a failed tool call (error in state)
+            msg2 = json.dumps({
+                "time": {"created": 2000, "completed": 2001},
+                "content": [
+                    {
+                        "type": "tool",
+                        "id": "call_err",
+                        "name": "read",
+                        "state": {
+                            "status": "error",
+                            "input": {"path": "missing.rs"},
+                            "error": {"type": "unknown", "message": "File not found"},
+                        },
+                    },
+                ],
+            })
+            # compaction marker
+            msg3 = json.dumps({"time": {"created": 1500}})
+            # synthetic message (should be dropped)
+            msg4 = json.dumps({"time": {"created": 1600}, "text": "harness injected"})
+            conn.execute("INSERT INTO session_message VALUES ('m1', 'ses_v2_2', 'user', 0, 1000, 1000, ?)", (msg1,))
+            conn.execute("INSERT INTO session_message VALUES ('m2', 'ses_v2_2', 'assistant', 1, 2000, 2001, ?)", (msg2,))
+            conn.execute("INSERT INTO session_message VALUES ('m3', 'ses_v2_2', 'compaction', 2, 1500, 1500, ?)", (msg3,))
+            conn.execute("INSERT INTO session_message VALUES ('m4', 'ses_v2_2', 'synthetic', 3, 1600, 1600, ?)", (msg4,))
+            conn.commit()
+            conn.close()
+
+            res = read_opencode2_session(db_path, "ses_v2_2")
+            self.assertEqual(res["tool"], "opencode2")
+            # 2 turns: user + assistant (compaction and synthetic dropped)
+            self.assertEqual(len(res["turns"]), 2)
+            # tool result is an error
+            assistant_turn = res["turns"][1]
+            self.assertEqual(len(assistant_turn["tool_results"]), 1)
+            self.assertTrue(assistant_turn["tool_results"][0]["is_error"])
+            self.assertIn("File not found", assistant_turn["tool_results"][0]["content"])
+            # warnings: history_compacted + harness_text_dropped
+            warning_codes = {w["code"] for w in res["warnings"]}
+            self.assertIn("history_compacted", warning_codes)
+            self.assertIn("harness_text_dropped", warning_codes)
+        finally:
+            gc.collect()
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_pi_reader(self):
+        """Test pi (pi-coding-agent) JSONL session reader."""
+        td = tempfile.mkdtemp()
+        try:
+            session_file = Path(td) / "2026-08-21T08-56-34-036Z_test-pi-session.jsonl"
+            records = [
+                {"type": "session", "version": 3, "id": "test-pi-session", "timestamp": "2026-08-21T08:56:34.036Z", "cwd": td},
+                {"type": "model_change", "id": "m1", "parentId": None, "timestamp": "2026-08-21T08:56:34.099Z", "provider": "openrouter", "modelId": "test-model"},
+                {"type": "thinking_level_change", "id": "t1", "parentId": "m1", "timestamp": "2026-08-21T08:56:34.099Z", "thinkingLevel": "medium"},
+                {"type": "message", "id": "u1", "parentId": "t1", "timestamp": "2026-08-21T08:57:23.443Z", "message": {"role": "user", "content": [{"type": "text", "text": "hello pi"}], "timestamp": 1787302643439}},
+                {"type": "message", "id": "a1", "parentId": "u1", "timestamp": "2026-08-21T08:57:25.000Z", "message": {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "user said hello"},
+                    {"type": "text", "text": "Hi! I'm pi."},
+                    {"type": "toolCall", "id": "call-1", "name": "bash", "arguments": {"command": "ls -la"}},
+                ]}},
+                {"type": "message", "id": "r1", "parentId": "a1", "timestamp": "2026-08-21T08:57:26.000Z", "message": {"role": "toolResult", "toolCallId": "call-1", "toolName": "bash", "content": [{"type": "text", "text": "total 0\ndrwxr-xr-x 2 user staff 64"}]}},
+                {"type": "message", "id": "a2", "parentId": "r1", "timestamp": "2026-08-21T08:57:27.000Z", "message": {"role": "assistant", "content": [
+                    {"type": "text", "text": "Done!"},
+                ]}},
+            ]
+            with session_file.open("w", encoding="utf-8") as f:
+                for r in records:
+                    f.write(json.dumps(r) + "\n")
+
+            res = read_pi_session(session_file)
+            self.assertEqual(res["tool"], "pi")
+            self.assertEqual(res["source"], "pi-coding-agent")
+            self.assertEqual(res["session_id"], "test-pi-session")
+            self.assertEqual(res["cwd"], td)
+            self.assertEqual(res["model"], "test-model")
+            # 3 turns: user + 2 assistant (toolResult 附加到 assistant)
+            self.assertEqual(len(res["turns"]), 3)
+            # user turn
+            self.assertEqual(res["turns"][0]["role"], "user")
+            self.assertIn("hello pi", res["turns"][0]["text"])
+            # first assistant turn with tool call + result
+            self.assertEqual(res["turns"][1]["role"], "assistant")
+            self.assertIn("Hi! I'm pi.", res["turns"][1]["text"])
+            self.assertEqual(len(res["turns"][1]["tool_calls"]), 1)
+            self.assertEqual(res["turns"][1]["tool_calls"][0]["name"], "bash")
+            # tool result attached
+            self.assertEqual(len(res["turns"][1]["tool_results"]), 1)
+            self.assertIn("total 0", res["turns"][1]["tool_results"][0]["content"])
+            # second assistant turn (no tools)
+            self.assertEqual(res["turns"][2]["role"], "assistant")
+            self.assertIn("Done!", res["turns"][2]["text"])
+            # thinking records skipped -> warning
+            warning_codes = {w["code"] for w in res["warnings"]}
+            self.assertIn("unsafe_records_skipped", warning_codes)
+            # digest renders
+            digest = sr.build_digest(res)
+            self.assertGreaterEqual(digest["turns_total"], 3)
+            rendered = sr.render_digest(res)
+            self.assertIn("pi", rendered.lower())
+        finally:
+            gc.collect()
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_dsh_reader(self):
+        """Test DSH (DeepSeek Harness) zstd-compressed JSONL session reader."""
+        try:
+            import zstandard
+        except ImportError:
+            self.skipTest("zstandard not available")
+        td = tempfile.mkdtemp()
+        try:
+            session_dir = Path(td) / "session-test-dsh-uuid"
+            session_dir.mkdir()
+            session_file = session_dir / "session.jsonl.zstd"
+            records = [
+                {"type": "session", "version": 0, "id": "session-test-dsh-uuid", "createdAt": 1787305966585, "cwd": td, "delegationDepth": 0, "agentPreset": "standard"},
+                {"type": "permission/preset", "seq": 0, "time": 1787305966706, "data": {"preset": "workspace-write", "origin": "default"}},
+                {"type": "session/title", "seq": 11, "time": 1787306265633, "data": {"title": "测试 DSH", "source": {"kind": "fallback"}}},
+                {"type": "user/message", "seq": 7, "time": 1787306087428, "data": {"content": [{"type": "text", "text": "你好"}], "source": {"kind": "user"}, "role": "user", "id": "u1"}},
+                {"type": "user/message", "seq": 8, "time": 1787306087429, "data": {"content": [{"type": "text", "text": "system context"}], "source": {"kind": "plugin"}, "role": "user", "id": "u2"}},
+                {"type": "assistant/message", "seq": 291, "time": 1787306091847, "data": {"turn": 1, "step": 1, "message": {"role": "assistant", "content": [
+                    {"type": "reasoning", "text": "user said hello"},
+                    {"type": "text", "text": "你好！我是 DSH。"},
+                ], "source": {"kind": "model", "model": "deepseek-v4-flash"}}}},
+                {"type": "tool/call", "seq": 398, "time": 1787306298999, "data": {"turn": 3, "step": 1, "callId": "call-1", "name": "web_search", "arguments": '{"queries":["test query"]}'}},
+                {"type": "tool/result", "seq": 399, "time": 1787306299011, "data": {"turn": 3, "step": 1, "message": {"source": {"kind": "tool", "callId": "call-1"}, "content": [
+                    {"type": "tool-result", "toolCallId": "call-1", "content": [{"type": "text", "text": "Search results here"}], "isError": False},
+                ], "role": "user", "id": "r1"}}},
+            ]
+            # 写入 zstd 压缩的 JSONL
+            jsonl_content = "\n".join(json.dumps(r) for r in records) + "\n"
+            cctx = zstandard.ZstdCompressor()
+            compressed = cctx.compress(jsonl_content.encode("utf-8"))
+            session_file.write_bytes(compressed)
+
+            res = read_dsh_session(session_file)
+            self.assertEqual(res["tool"], "dsh")
+            self.assertEqual(res["source"], "deepseek-harness")
+            self.assertEqual(res["session_id"], "session-test-dsh-uuid")
+            self.assertEqual(res["cwd"], td)
+            self.assertEqual(res["title"], "测试 DSH")
+            self.assertEqual(res["model"], "deepseek-v4-flash")
+            # 3 turns: user (plugin 消息被跳过) + assistant + tool/call
+            self.assertEqual(len(res["turns"]), 3)
+            # user turn
+            self.assertEqual(res["turns"][0]["role"], "user")
+            self.assertIn("你好", res["turns"][0]["text"])
+            # assistant turn
+            self.assertEqual(res["turns"][1]["role"], "assistant")
+            self.assertIn("你好！我是 DSH。", res["turns"][1]["text"])
+            # tool/call turn with result
+            self.assertEqual(res["turns"][2]["role"], "assistant")
+            self.assertEqual(len(res["turns"][2]["tool_calls"]), 1)
+            self.assertEqual(res["turns"][2]["tool_calls"][0]["name"], "web_search")
+            self.assertEqual(len(res["turns"][2]["tool_results"]), 1)
+            self.assertIn("Search results", res["turns"][2]["tool_results"][0]["content"])
+            # plugin message dropped -> warning
+            warning_codes = {w["code"] for w in res["warnings"]}
+            self.assertIn("harness_text_dropped", warning_codes)
+            # digest renders
+            digest = sr.build_digest(res)
+            self.assertGreaterEqual(digest["turns_total"], 3)
+            rendered = sr.render_digest(res)
+            self.assertIn("DSH", rendered)
         finally:
             gc.collect()
             import shutil

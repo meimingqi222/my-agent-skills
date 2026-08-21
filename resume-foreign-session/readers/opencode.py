@@ -1,4 +1,4 @@
-"""OpenCode and zcode session reader and discovery."""
+"""OpenCode, zcode, and OpenCode v2 session reader and discovery."""
 
 from __future__ import annotations
 
@@ -347,6 +347,366 @@ def _find_opencode_schema_id(
             return {
                 "tool": tool,
                 "source": source,
+                "session_id": session_id,
+                "path": str(database_path),
+                "title": _one_line(title, 200) if isinstance(title, str) else None,
+                "cwd": directory if isinstance(directory, str) else cwd,
+                "updated_at_ms": updated,
+                "updated_at": _iso_from_millis(updated),
+                "source_repo_root_path": None,
+            }
+        except (ReaderError, sqlite3.Error):
+            continue
+    return None
+
+
+# ---------------------------------------------------------------------------
+# OpenCode v2 (session_v2 + session_message schema)
+# ---------------------------------------------------------------------------
+
+def _opencode2_model_id(model: Any) -> str | None:
+    """从 session_v2 的 model JSON 字符串中提取模型 ID。"""
+    if not isinstance(model, str):
+        return None
+    try:
+        value = json.loads(model)
+    except json.JSONDecodeError:
+        return model
+    if isinstance(value, dict):
+        model_id = value.get("id")
+        if isinstance(model_id, str):
+            return model_id
+    return model
+
+
+def _opencode2_tool_output(state: dict[str, Any], max_chars: int) -> str | None:
+    """从 v2 tool part 的 state 中提取输出文本。
+
+    v2 的输出在 ``state.content``（一个 ``[{type, text}]`` 数组）或
+    ``state.error`` 中，而不是 v1 的 ``state.output`` 字符串。
+    """
+    content = state.get("content")
+    if isinstance(content, list):
+        texts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text)
+        if texts:
+            return _one_line("\n".join(texts), max_chars)
+    error = state.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        if isinstance(message, str):
+            return _one_line(message, max_chars)
+    elif isinstance(error, str) and error.strip():
+        return _one_line(error, max_chars)
+    return None
+
+
+def read_opencode2_session(
+    database_path: Path | str, session_id: str, max_tool_chars: int = 300
+) -> dict[str, Any]:
+    """读取一个 opencode v2 会话（session_v2 + session_message schema）。"""
+    database_path = Path(database_path).expanduser()
+    warnings: list[dict[str, str]] = []
+    turns: list[dict[str, Any]] = []
+    index = WorkIndex()
+    prior_context: dict[str, Any] | None = None
+    try:
+        with _open_sqlite_readonly(database_path) as database:
+            v2_columns = _table_columns(database, "session_v2")
+            if not v2_columns:
+                raise ReaderError(
+                    f"no session_v2 table in {database_path}; "
+                    "this database does not contain opencode v2 sessions"
+                )
+            optional = [
+                name
+                for name in ("agent", "model", "parent_id", "version")
+                if name in v2_columns
+            ]
+            row = database.execute(
+                "SELECT directory, title, time_created, time_updated"
+                + "".join(f", {name}" for name in optional)
+                + " FROM session_v2 WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise ReaderError(
+                    f"no opencode v2 session {session_id} in {database_path}"
+                )
+            directory, title, created_at, updated_at = row[:4]
+            extra = dict(zip(optional, row[4:]))
+            agent = extra.get("agent")
+            model = extra.get("model")
+            parent_id = extra.get("parent_id")
+            message_agent: str | None = None
+            message_model: str | None = None
+
+            # 读取 session_message 表
+            msg_columns = _table_columns(database, "session_message")
+            if not msg_columns:
+                raise ReaderError(
+                    f"no session_message table in {database_path}"
+                )
+            rows = database.execute(
+                "SELECT id, type, data FROM session_message "
+                "WHERE session_id = ? ORDER BY seq, time_created",
+                (session_id,),
+            ).fetchall()
+            skipped = 0
+            synthetic = 0
+            compaction_count = 0
+            for message_id, msg_type, raw in rows:
+                if not isinstance(msg_type, str):
+                    continue
+                # compaction 消息：跳过，但记录
+                if msg_type == "compaction":
+                    compaction_count += 1
+                    continue
+                # synthetic 消息：跳过（harness 注入文本）
+                if msg_type == "synthetic":
+                    synthetic += 1
+                    continue
+                if msg_type not in {"user", "assistant"}:
+                    skipped += 1
+                    continue
+                try:
+                    message = json.loads(raw) if isinstance(raw, str) else None
+                except (json.JSONDecodeError, TypeError):
+                    skipped += 1
+                    continue
+                if not isinstance(message, dict):
+                    continue
+
+                if msg_type == "assistant":
+                    named_agent = message.get("agent")
+                    if isinstance(named_agent, str) and named_agent:
+                        message_agent = named_agent
+                    named_model = message.get("model")
+                    if isinstance(named_model, dict):
+                        model_id = named_model.get("id")
+                        if isinstance(model_id, str) and model_id:
+                            message_model = model_id
+                    elif isinstance(named_model, str) and named_model:
+                        message_model = named_model
+
+                texts: list[str] = []
+                calls: list[dict[str, Any]] = []
+                results: list[dict[str, Any]] = []
+
+                # v2 user 消息：text 直接在顶层
+                if msg_type == "user":
+                    text = message.get("text")
+                    if isinstance(text, str) and text.strip():
+                        texts.append(_safe_text(text))
+                else:
+                    # v2 assistant 消息：content 数组包含 parts
+                    content = message.get("content")
+                    if isinstance(content, list):
+                        for part in content:
+                            if not isinstance(part, dict):
+                                continue
+                            part_type = part.get("type")
+                            if part_type == "text":
+                                text = part.get("text")
+                                if isinstance(text, str) and text.strip():
+                                    texts.append(_safe_text(text))
+                            elif part_type == "tool":
+                                state = part.get("state")
+                                if not isinstance(state, dict):
+                                    state = {}
+                                call_id = part.get("id")
+                                tool_name = part.get("name") or part.get("tool") or "tool"
+                                index.record(tool_name, state.get("input", {}))
+                                calls.append(
+                                    {
+                                        "id": call_id,
+                                        "name": _safe_text(tool_name),
+                                        "input": _json_preview(
+                                            state.get("input", {}), max_tool_chars
+                                        ),
+                                        "inert": True,
+                                    }
+                                )
+                                output = _opencode2_tool_output(state, max_tool_chars)
+                                if output is not None:
+                                    status = str(state.get("status") or "")
+                                    results.append(
+                                        {
+                                            "tool_use_id": call_id,
+                                            "content": output,
+                                            "is_error": status in {"error", "rejected"}
+                                            or "error" in state,
+                                            "unavailable": False,
+                                            "inert": True,
+                                        }
+                                    )
+                            elif part_type == "reasoning":
+                                skipped += 1
+
+                text = "\n".join(part for part in texts if part.strip())
+                if text or calls or results:
+                    turns.append(
+                        _turn(msg_type, text=text, tool_calls=calls, tool_results=results)
+                    )
+
+            if compaction_count:
+                _add_warning(
+                    warnings,
+                    "history_compacted",
+                    f"Skipped {compaction_count} compaction marker(s); "
+                    "earlier turns may have been summarized by the harness.",
+                )
+            if skipped:
+                _add_warning(
+                    warnings,
+                    "unsafe_records_skipped",
+                    f"Skipped {skipped} opencode v2 reasoning/unknown part(s).",
+                )
+            if synthetic:
+                _add_warning(
+                    warnings,
+                    "harness_text_dropped",
+                    f"Dropped {synthetic} harness-written opencode v2 synthetic message(s).",
+                )
+
+            # 读取 todo 表（与 v1 共用）
+            try:
+                todo_rows = database.execute(
+                    "SELECT content, status, priority FROM todo "
+                    "WHERE session_id = ? ORDER BY position, time_created",
+                    (session_id,),
+                ).fetchall()
+                for todo_content, todo_status, _priority in todo_rows:
+                    if isinstance(todo_content, str) and todo_content.strip():
+                        index.record(
+                            "todowrite",
+                            {
+                                "todos": [
+                                    {
+                                        "content": todo_content,
+                                        "status": todo_status or "pending",
+                                    }
+                                ]
+                            },
+                        )
+            except sqlite3.Error:
+                pass
+
+    except sqlite3.Error as exc:
+        raise ReaderError(
+            f"failed to read opencode v2 database {database_path}: {exc}"
+        ) from exc
+
+    if not isinstance(agent, str) or not agent:
+        agent = message_agent
+    if model is None:
+        model = message_model
+
+    result = {
+        "tool": "opencode2",
+        "source": "opencode-v2",
+        "session_id": session_id,
+        "path": str(database_path),
+        "title": _one_line(title, 200) if isinstance(title, str) else None,
+        "cwd": directory if isinstance(directory, str) else None,
+        "branch": None,
+        "created_at": _iso_from_millis(_timestamp_to_millis(created_at)),
+        "updated_at": _iso_from_millis(_timestamp_to_millis(updated_at)),
+        "source_repo_root_path": None,
+        "turns": turns,
+        "warnings": warnings,
+        "model": _opencode2_model_id(model),
+        "agent": agent if isinstance(agent, str) else None,
+        "prior_context": prior_context,
+    }
+    if parent_id:
+        _add_warning(
+            warnings,
+            "subagent_session",
+            f"This opencode v2 session has parent_id {parent_id}; "
+            "it may be a subagent transcript rather than user-driven work.",
+        )
+    return _finalize_result(result, index)
+
+
+def _discover_opencode2(cwd: str | None, within_min: int) -> list[dict[str, Any]]:
+    """发现 opencode v2 会话（从 session_v2 表）。"""
+    sessions: list[dict[str, Any]] = []
+    for database_path in _opencode_db_paths():
+        try:
+            with _open_sqlite_readonly(database_path) as database:
+                v2_columns = _table_columns(database, "session_v2")
+                if not v2_columns:
+                    continue
+                optional = [
+                    name
+                    for name in ("agent", "model", "parent_id")
+                    if name in v2_columns
+                ]
+                # 过滤已归档的会话和子代理会话
+                where = "COALESCE(time_archived, 0) = 0"
+                if "parent_id" in v2_columns:
+                    where += " AND parent_id IS NULL"
+                rows = database.execute(
+                    "SELECT id, directory, title, time_created, time_updated"
+                    + "".join(f", {name}" for name in optional)
+                    + f" FROM session_v2 WHERE {where} "
+                    "ORDER BY time_updated DESC"
+                ).fetchall()
+        except (ReaderError, sqlite3.Error):
+            continue
+        for row in rows:
+            session_id, directory, title, created_at, updated_at = row[:5]
+            extra = dict(zip(optional, row[5:]))
+            if not isinstance(session_id, str):
+                continue
+            if cwd is not None:
+                if not isinstance(directory, str) or not _paths_match(directory, cwd):
+                    continue
+            updated = _timestamp_to_millis(updated_at)
+            if updated is not None and not _within(updated, within_min):
+                continue
+            sessions.append(
+                {
+                    "tool": "opencode2",
+                    "source": "opencode-v2",
+                    "session_id": session_id,
+                    "path": str(database_path),
+                    "title": _one_line(title, 200) if isinstance(title, str) else None,
+                    "cwd": directory if isinstance(directory, str) else None,
+                    "branch": None,
+                    "updated_at_ms": updated,
+                    "updated_at": _iso_from_millis(updated),
+                    "source_repo_root_path": None,
+                    "model": _opencode2_model_id(extra.get("model")),
+                }
+            )
+    return sessions
+
+
+def _find_opencode2_id(session_id: str, cwd: str) -> dict[str, Any] | None:
+    """按 native session ID 查找 opencode v2 会话。"""
+    for database_path in _opencode_db_paths():
+        try:
+            with _open_sqlite_readonly(database_path) as database:
+                v2_columns = _table_columns(database, "session_v2")
+                if not v2_columns:
+                    continue
+                row = database.execute(
+                    "SELECT directory, title, time_updated FROM session_v2 WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+            if row is None:
+                continue
+            directory, title, updated_at = row
+            updated = _timestamp_to_millis(updated_at)
+            return {
+                "tool": "opencode2",
+                "source": "opencode-v2",
                 "session_id": session_id,
                 "path": str(database_path),
                 "title": _one_line(title, 200) if isinstance(title, str) else None,

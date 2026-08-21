@@ -28,9 +28,12 @@ from readers import (
     _discover_cursor_desktop,
     _discover_devin_cli,
     _discover_devin_next,
+    _discover_dsh,
     _discover_grok,
     _discover_maka,
     _discover_opencode,
+    _discover_opencode2,
+    _discover_pi,
     _discover_qoder,
     _discover_zcode,
     _find_amp_id,
@@ -39,16 +42,24 @@ from readers import (
     _find_commandcode_id,
     _find_cursor_id,
     _find_devin_id,
+    _find_dsh_id,
     _find_grok_id,
     _find_maka_id,
+    _find_opencode2_id,
     _find_opencode_id,
+    _find_pi_id,
     _find_qoder_id,
     _find_zcode_id,
     _grok_config_dir,
     _grok_meta,
     _grok_session_dir,
     _is_commandcode_transcript,
+    _pi_data_dir,
+    _pi_quick_meta,
+    _pi_session_id_from_path,
     _qoder_config_dir,
+    _dsh_data_dir,
+    _dsh_quick_meta,
     read_amp_session,
     read_claude_session,
     read_codex_session,
@@ -56,9 +67,12 @@ from readers import (
     read_cursor_session,
     read_devin_cli_session,
     read_devin_next_session,
+    read_dsh_session,
     read_grok_session,
     read_maka_session,
+    read_opencode2_session,
     read_opencode_session,
+    read_pi_session,
     read_qoder_session,
     read_zcode_session,
 )
@@ -101,12 +115,15 @@ CURRENT_SESSION_ENV = (
     "CURSOR_SESSION_ID",
     "AMP_THREAD_ID",
     "OPENCODE_SESSION_ID",
+    "OPENCODE2_SESSION_ID",
     "DEVIN_SESSION_ID",
     "QODER_SESSION_ID",
     "COMMANDCODE_SESSION_ID",
     "COMMAND_CODE_SESSION_ID",
     "GROK_SESSION_ID",
     "ZCODE_SESSION_ID",
+    "PI_SESSION_ID",
+    "DSH_SESSION_ID",
 )
 
 
@@ -169,6 +186,8 @@ def discover_sessions(
         sessions.extend(_discover_devin_next(requested_cwd, within_min))
     elif tool == "opencode":
         sessions = _discover_opencode(requested_cwd, within_min)
+    elif tool == "opencode2":
+        sessions = _discover_opencode2(requested_cwd, within_min)
     elif tool == "qoder":
         sessions = _discover_qoder(requested_cwd, within_min)
     elif tool == "commandcode":
@@ -179,6 +198,10 @@ def discover_sessions(
         sessions = _discover_zcode(requested_cwd, within_min)
     elif tool == "maka":
         sessions = _discover_maka(requested_cwd, within_min)
+    elif tool == "pi":
+        sessions = _discover_pi(requested_cwd, within_min)
+    elif tool == "dsh":
+        sessions = _discover_dsh(requested_cwd, within_min)
     else:
         sessions = _discover_cursor_cli(requested_cwd, within_min)
         sessions.extend(_discover_cursor_desktop(requested_cwd, within_min))
@@ -323,6 +346,37 @@ def _candidate_from_path(tool: str, raw_path: str, cwd: str) -> dict[str, Any] |
             "cwd": cwd,
             "updated_at_ms": updated,
         }
+    if tool == "pi" and path.is_file() and path.suffix == ".jsonl":
+        # 排除其他工具的 .jsonl 文件
+        if _under(path, _pi_data_dir()):
+            meta = _pi_quick_meta(path)
+            if meta is None:
+                return None
+            return {
+                "tool": tool,
+                "source": "pi-coding-agent",
+                "session_id": meta["session_id"],
+                "path": str(path),
+                "title": None,
+                "cwd": meta.get("cwd") or cwd,
+                "updated_at_ms": updated,
+            }
+        return None
+    if tool == "dsh" and path.is_file() and path.name == "session.jsonl.zstd":
+        if _under(path, _dsh_data_dir()):
+            meta = _dsh_quick_meta(path)
+            if meta is None:
+                return None
+            return {
+                "tool": tool,
+                "source": "deepseek-harness",
+                "session_id": meta["session_id"],
+                "path": str(path),
+                "title": meta.get("title"),
+                "cwd": meta.get("cwd") or cwd,
+                "updated_at_ms": updated,
+            }
+        return None
     return None
 
 
@@ -334,11 +388,14 @@ def _finders() -> dict[str, Any]:
         "amp": lambda sid, cwd: _find_amp_id(sid, cwd),
         "devin": lambda sid, cwd: _find_devin_id(sid, cwd, _candidate_from_path),
         "opencode": _find_opencode_id,
+        "opencode2": _find_opencode2_id,
         "qoder": lambda sid, cwd: _find_qoder_id(sid, cwd, _candidate_from_path),
         "commandcode": lambda sid, cwd: _find_commandcode_id(sid, cwd, _candidate_from_path),
         "grok": lambda sid, cwd: _find_grok_id(sid, cwd, _candidate_from_path),
         "zcode": _find_zcode_id,
         "maka": _find_maka_id,
+        "pi": lambda sid, cwd: _find_pi_id(sid, cwd, _candidate_from_path),
+        "dsh": lambda sid, cwd: _find_dsh_id(sid, cwd, _candidate_from_path),
     }
 
 
@@ -423,6 +480,8 @@ def read_resolved_session(
         return read_devin_cli_session(candidate["path"], max_tool_chars)
     if tool == "opencode":
         return read_opencode_session(candidate["path"], candidate["session_id"], max_tool_chars)
+    if tool == "opencode2":
+        return read_opencode2_session(candidate["path"], candidate["session_id"], max_tool_chars)
     if tool == "qoder":
         return read_qoder_session(candidate["path"], max_tool_chars)
     if tool == "commandcode":
@@ -435,4 +494,8 @@ def read_resolved_session(
         return read_zcode_session(candidate["path"], candidate["session_id"], max_tool_chars)
     if tool == "maka":
         return read_maka_session(candidate["path"], candidate["session_id"], max_tool_chars)
+    if tool == "pi":
+        return read_pi_session(candidate["path"], max_tool_chars)
+    if tool == "dsh":
+        return read_dsh_session(candidate["path"], max_tool_chars)
     return read_cursor_session(candidate, max_tool_chars)

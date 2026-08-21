@@ -22,11 +22,14 @@ TOOLS = (
     "amp",
     "devin",
     "opencode",
+    "opencode2",
     "qoder",
     "commandcode",
     "grok",
     "zcode",
     "maka",
+    "pi",
+    "dsh",
 )
 ANY_TOOL = "any"
 SELECTABLE = TOOLS + (ANY_TOOL,)
@@ -38,6 +41,13 @@ TOOL_ALIASES = {
     "grokbuild": "grok",
     "z-code": "zcode",
     "maka-agent": "maka",
+    "opencode-2": "opencode2",
+    "opencodev2": "opencode2",
+    "pi-coding-agent": "pi",
+    "pi-agent": "pi",
+    "deepseek": "dsh",
+    "deepseek-harness": "dsh",
+    "deepseek-cli": "dsh",
 }
 
 UUID_RE = re.compile(
