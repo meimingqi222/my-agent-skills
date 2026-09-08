@@ -12,6 +12,7 @@ Each skill lives in its own folder containing a `SKILL.md` (with the required
 | --- | --- |
 | [resume-foreign-session](resume-foreign-session/) | Resume or continue work from a recent session created by another coding agent: Claude Code, Codex, Cursor, AmpCode, Devin, OpenCode, Qoder, Command Code, Grok (Grok Build), or zcode. Reads the foreign session transcripts, produces a safe handoff summary, and surfaces the most recent session even when run from a directory with no matching sessions. |
 | [windows-window-ops](windows-window-ops/) | Find, enumerate, inspect, wait for, foreground, move, close, screenshot, and send keys to native Win32 desktop windows. Handles secondary, hidden, covered, minimized, maximized, and off-screen windows with DPI-correct coordinates and verified state restoration. |
+| [regression-notes](regression-notes/) | Record bug-fix decisions as Agent Notes bound to regression tests so AI-driven code changes cannot silently regress. Ships a bug-fix template, a new-note scaffolder, and a dependency-free verifier for CI. |
 
 ## Installation
 
@@ -56,6 +57,24 @@ and are auto-loaded. (Only use this if that directory does not already contain
 personal skills.)
 
 ## Usage
+
+### regression-notes
+
+The `regression-notes` skill ports the DeepSeek Harness Agent Note loop in
+lightweight form: each non-trivial bug fix ships one note (the why) plus one
+regression test (the lock). Scaffold a note, fill in `Problem / Decision /
+Alternatives considered / Consequences / Verification`, then verify:
+
+```bash
+python3 regression-notes/scripts/new-note.py --class bug-fix --status implemented my-fix-slug
+python3 regression-notes/scripts/verify-notes.py --notes-dir .agents/notes
+```
+
+`--notes-dir` defaults to `.agents/notes/` and honors `NOTES_DIR`;
+`--no-strict` degrades a missing test target to a warning. Run
+`python -m unittest discover -s regression-notes/tests` after changing the
+verifier. See the skill's `SKILL.md` for the layout, format rules, and CI
+one-liner.
 
 ### windows-window-ops
 
