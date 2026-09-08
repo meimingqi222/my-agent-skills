@@ -15,14 +15,12 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TEMPLATE = HERE.parent / "templates" / "bug-fix.md"
 
-# Keep in sync with the verifier's CLASSES constant.
-CLASSES = ("bug-fix", "feature", "architecture", "process", "testing", "simplification")
-
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("slug", help="topic slug, e.g. login-retry-race")
-    ap.add_argument("--class", dest="cls", default="bug-fix", choices=CLASSES)
+    ap.add_argument("--class", dest="cls", default="bug-fix", choices=("bug-fix",),
+                    help="only bug-fix is scaffolded; the other classes are hand-written")
     ap.add_argument("--status", default="proposed", choices=("proposed", "implemented", "rejected"))
     ap.add_argument("--test", dest="tests", action="append", default=[],
                     help="regression test path for ## Verification, repeatable; "

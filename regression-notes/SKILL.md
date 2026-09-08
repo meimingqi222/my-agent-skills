@@ -133,7 +133,7 @@ Notes are path-encoded as `{proposed,implemented,rejected,archived}/{class}/yyyy
   - `proposed/` (`Status: proposed`) → `implemented/` (`Status: implemented`) → `archived/` (`Status: implemented` + `Archived: YYYY-MM-DD`). Moving `proposed/` → `implemented/` means rewriting `## Proposal` into a present-tense `## Decision` and folding `## Acceptance criteria` / `## Risks` into `## Consequences`.
   - `rejected/` (`Status: rejected — <why>`) keeps proposal-time sections (`## Problem`, `## Proposal`, `## Alternatives considered`, optionally `## Acceptance criteria` / `## Risks`) and is kept only while the losing proposal remains a tempting mistake.
   - `archived/` notes are frozen: once they carry `Archived: YYYY-MM-DD` they must not be edited again, and every archived note must be sealed (see below).
-- **Class** is closed: `bug-fix, feature, architecture, process, testing, simplification`. Adding a class requires updating this file, the `CLASSES` constant in `verify-notes.py`, and the `CLASSES` constant in `new-note.py` together.
+- **Class** is closed: `bug-fix, feature, architecture, process, testing, simplification`. Adding a class requires updating this file and the `CLASSES` constant in `verify-notes.py` together; `new-note.py` scaffolds `bug-fix` only.
 
 Every note follows one skeleton. `bug-fix` uses `templates/bug-fix.md`:
 
