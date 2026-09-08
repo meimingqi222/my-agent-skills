@@ -2,15 +2,19 @@
 """Verify regression-notes tree: layout, format, status consistency, test binding.
 
 Usage:
-    python3 verify-notes.py [--notes-dir .agents/notes] [--repo-root .] [--no-strict] [--allow-missing]
+    python3 verify-notes.py [--notes-dir .agents/notes] [--repo-root .] [--no-strict] [--allow-missing] [--seal]
 
 Exit non-zero on any error. With --no-strict, a missing regression-test
 path degrades to a warning; with --allow-missing, a missing notes directory
-does not fail.
+does not fail. --seal verifies the tree, then records every archived note's
+SHA-256 in `archived/manifest.json`; once sealed, any later modification or
+deletion of an archived note fails verification.
 """
 
 import argparse
 import datetime
+import hashlib
+import json
 import os
 import re
 import sys
@@ -20,6 +24,7 @@ LIFECYCLES = ("proposed", "implemented", "rejected", "archived")
 CLASSES = ("bug-fix", "feature", "architecture", "process", "testing", "simplification")
 FILENAME_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-.+\.md$")
 SKIP_NAMES = {"AGENTS.md", "CLAUDE.md", "README.md", "manifest.json"}
+MANIFEST_NAME = "manifest.json"
 
 # Per-lifecycle status line grammar.
 STATUS_RE = {
@@ -99,6 +104,22 @@ def parse_header(lines, lifecycle, path):
             errors.append(f"{path}: L4 must be blank")
 
     return errors
+
+
+def note_digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_manifest(notes):
+    """The archived-freeze manifest, or None when the file is not a JSON object."""
+    path = notes / "archived" / MANIFEST_NAME
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def check_file(path, lifecycle, cls, repo_root, strict):
@@ -199,12 +220,18 @@ def main(argv=None):
         action="store_true",
         help="treat a missing notes directory as OK (not recommended for CI)",
     )
+    ap.add_argument(
+        "--seal",
+        action="store_true",
+        help="record the SHA-256 of every archived note in archived/manifest.json",
+    )
     args = ap.parse_args(argv)
 
     notes = Path(args.notes_dir)
     repo = Path(args.repo_root)
     strict = not args.no_strict
     errors, warnings = [], []
+    archived = []
 
     if not notes.is_dir():
         msg = f"no notes dir at {notes}"
@@ -246,9 +273,32 @@ def main(argv=None):
                 if not FILENAME_RE.match(md.name):
                     errors.append(f"{md}: filename must be `yyyy-mm-dd-topic.md`")
                     continue
+                if top.name == "archived":
+                    archived.append((md, md.relative_to(notes).as_posix()))
                 e, w = check_file(md, top.name, second.name, repo, strict)
                 errors.extend(e)
                 warnings.extend(w)
+
+    manifest = load_manifest(notes)
+    if manifest is None:
+        errors.append(f"{notes}/archived/{MANIFEST_NAME}: manifest must be a JSON object")
+    else:
+        if args.seal and not errors:
+            new = [(md, rel) for md, rel in archived if rel not in manifest]
+            for md, rel in new:
+                manifest[rel] = note_digest(md)
+            if new:
+                (notes / "archived" / MANIFEST_NAME).write_text(
+                    json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                print(f"sealed {len(new)} archived note(s)")
+        live = {rel for _, rel in archived}
+        for rel in sorted(set(manifest) - live):
+            errors.append(f"{notes}/{rel}: sealed archived note is missing")
+        for md, rel in archived:
+            if rel not in manifest:
+                errors.append(f"{notes}/{rel}: archived note is not sealed (run with --seal)")
+            elif manifest[rel] != note_digest(md):
+                errors.append(f"{notes}/{rel}: archived note was modified after sealing")
 
     for w in warnings:
         print(w)

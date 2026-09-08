@@ -2,6 +2,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -32,6 +33,11 @@ Covered by `tests/test_login.py`.
 
 Proved: temporarily disabled the latch → the test above failed as expected, then reverted.
 """
+
+ARCHIVED_GOOD = GOOD.replace(
+    "Status: implemented",
+    f"Status: implemented\nArchived: {date.today():%Y-%m-%d}",
+)
 
 
 def write_tree(root, notes):
@@ -187,14 +193,16 @@ class TestVerifyNotes(unittest.TestCase):
         r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def test_archived_note_passes(self):
-        from datetime import date
-        archived = GOOD.replace(
-            "Status: implemented",
-            f"Status: implemented\nArchived: {date.today():%Y-%m-%d}"
-        )
-        r = self.run_verifier({"archived/bug-fix/2026-09-01-login-retry-race.md": archived})
+    def test_archived_note_passes_when_sealed(self):
+        r = self.run_verifier({"archived/bug-fix/2026-09-01-login-retry-race.md": ARCHIVED_GOOD},
+                              extra=["--seal"])
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("sealed 1 archived note(s)", r.stdout)
+
+    def test_unsealed_archived_note_fails(self):
+        r = self.run_verifier({"archived/bug-fix/2026-09-01-login-retry-race.md": ARCHIVED_GOOD})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not sealed", r.stdout)
 
     def test_archived_note_missing_date_fails(self):
         r = self.run_verifier({"archived/bug-fix/2026-09-01-login-retry-race.md": GOOD})
@@ -345,6 +353,70 @@ Add exponential backoff to the login retry path.
                 capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("slug", r.stderr.lower())
+
+    def test_seal_roundtrip_and_tamper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {"archived/bug-fix/2026-09-01-login-retry-race.md": ARCHIVED_GOOD})
+
+            def run(*extra):
+                return subprocess.run(
+                    [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                     "--notes-dir", str(notes), "--repo-root", str(root), *extra],
+                    capture_output=True, text=True)
+
+            unsealed = run()
+            self.assertNotEqual(unsealed.returncode, 0)
+            self.assertIn("not sealed", unsealed.stdout)
+
+            sealed = run("--seal")
+            self.assertEqual(sealed.returncode, 0, sealed.stdout + sealed.stderr)
+            manifest = notes / "archived" / "manifest.json"
+            self.assertTrue(manifest.exists())
+            before = manifest.read_bytes()
+            self.assertEqual(run().returncode, 0)
+
+            note = notes / "archived" / "bug-fix" / "2026-09-01-login-retry-race.md"
+            note.write_text(ARCHIVED_GOOD + "\nTampered.", encoding="utf-8")
+            tampered = run()
+            self.assertNotEqual(tampered.returncode, 0)
+            self.assertIn("modified", tampered.stdout)
+            self.assertEqual(manifest.read_bytes(), before)
+            self.assertNotEqual(run("--seal").returncode, 0)
+            self.assertEqual(manifest.read_bytes(), before)
+
+    def test_sealed_note_deletion_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes = root / "notes"
+            write_tree(notes, {"archived/bug-fix/2026-09-01-login-retry-race.md": ARCHIVED_GOOD})
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            run = lambda *extra: subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root), *extra],
+                capture_output=True, text=True)
+            self.assertEqual(run("--seal").returncode, 0)
+            (notes / "archived" / "bug-fix" / "2026-09-01-login-retry-race.md").unlink()
+            r = run()
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("missing", r.stdout)
+
+    def test_malformed_manifest_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes = root / "notes"
+            write_tree(notes, {"archived/bug-fix/2026-09-01-login-retry-race.md": ARCHIVED_GOOD})
+            (notes / "archived" / "manifest.json").write_text("not json", encoding="utf-8")
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root)],
+                capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("manifest", r.stdout)
 
 
 if __name__ == "__main__":

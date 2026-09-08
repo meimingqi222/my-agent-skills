@@ -132,7 +132,7 @@ Notes are path-encoded as `{proposed,implemented,rejected,archived}/{class}/yyyy
 - **Lifecycle** is the status:
   - `proposed/` (`Status: proposed`) → `implemented/` (`Status: implemented`) → `archived/` (`Status: implemented` + `Archived: YYYY-MM-DD`). Moving `proposed/` → `implemented/` means rewriting `## Proposal` into a present-tense `## Decision` and folding `## Acceptance criteria` / `## Risks` into `## Consequences`.
   - `rejected/` (`Status: rejected — <why>`) keeps proposal-time sections (`## Problem`, `## Proposal`, `## Alternatives considered`, optionally `## Acceptance criteria` / `## Risks`) and is kept only while the losing proposal remains a tempting mistake.
-  - `archived/` notes are frozen: once they carry `Archived: YYYY-MM-DD` they must not be edited again.
+  - `archived/` notes are frozen: once they carry `Archived: YYYY-MM-DD` they must not be edited again, and every archived note must be sealed (see below).
 - **Class** is closed: `bug-fix, feature, architecture, process, testing, simplification`. Adding a class requires updating this file, the `CLASSES` constant in `verify-notes.py`, and the `CLASSES` constant in `new-note.py` together.
 
 Every note follows one skeleton. `bug-fix` uses `templates/bug-fix.md`:
@@ -161,6 +161,17 @@ Rules the verifier enforces:
   - a `Proved:` line recording that the regression test was seen to fail before the fix and to pass after; the line must not still carry the template placeholder.
 - Filenames must encode a valid calendar date and not be in the future.
 - Only `.md` files live in the notes tree.
+- Every archived note must be sealed in `archived/manifest.json`; a sealed note that is later modified or deleted fails verification.
+
+## Sealing the archive
+
+The archive freeze is machine-checked, not a convention. When a note moves to `archived/`, seal it in the same change:
+
+```bash
+python3 "$SCRIPTS/verify-notes.py" --seal
+```
+
+`--seal` verifies the tree, then records each archived note's SHA-256 in `archived/manifest.json`. The manifest is append-only: `--seal` adds missing entries and refuses to rewrite a recorded hash, so a note that was modified after sealing stays red — fix forward with a new note instead of editing history. Plain verification, including the CI one-liner, fails on any archived note that is unsealed, modified, or deleted.
 
 ## Keep the corpus current
 
