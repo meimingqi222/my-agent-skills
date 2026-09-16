@@ -20,7 +20,7 @@ Status: implemented
 
 ## Verification
 
-<Regression test pinning this behavior (must reference at least one test path that exists in the repo):>
+<Regression test pinning this behavior. Cite at least one path that exists in the repo; to bind one exact test, write `path::anchor`:>
 
 - `tests/...`
 

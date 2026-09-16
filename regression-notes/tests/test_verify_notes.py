@@ -171,15 +171,111 @@ class TestVerifyNotes(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("reason", r.stderr.lower())
 
-    def test_new_note_rejects_non_bugfix_class(self):
+    def test_new_note_scaffolds_every_class(self):
+        """Every class in the verifier's closed set scaffolds and verifies. A
+        `proposed` scaffold is used because an `implemented` bug-fix deliberately
+        fails until its `Proved:` placeholder is replaced."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "verify_notes", SKILL_DIR / "scripts" / "verify-notes.py")
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+        for cls in verifier.CLASSES:
+            with self.subTest(cls=cls):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    (root / "tests").mkdir()
+                    (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+                    notes = root / "notes"
+                    r = subprocess.run(
+                        [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"),
+                         "some-topic", "--class", cls, "--status", "proposed",
+                         "--notes-dir", str(notes)],
+                        capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                    r = subprocess.run(
+                        [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                         "--notes-dir", str(notes), "--repo-root", str(root)],
+                        capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_new_note_rejects_unknown_class(self):
         with tempfile.TemporaryDirectory() as tmp:
             r = subprocess.run(
                 [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"),
-                 "some-idea", "--class", "feature",
+                 "some-idea", "--class", "not-a-class",
                  "--notes-dir", str(Path(tmp) / "notes")],
                 capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
-            self.assertIn("bug-fix", r.stderr)
+            self.assertIn("invalid choice", r.stderr)
+
+    def test_new_note_partly_supersedes_adds_section_and_pointer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes = root / "notes"
+            write_tree(notes, {"implemented/bug-fix/2026-09-01-old-decision.md": GOOD})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"),
+                 "new-decision", "--class", "bug-fix", "--status", "implemented",
+                 "--partly-supersedes", "2026-09-01-old-decision.md",
+                 "--notes-dir", str(notes)],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            created = notes / "implemented" / "bug-fix" / f"{date.today():%Y-%m-%d}-new-decision.md"
+            body = created.read_text(encoding="utf-8")
+            self.assertIn("Partly-superseded-by: 2026-09-01-old-decision.md", body)
+            self.assertIn("## Superseded", body)
+
+    def test_new_note_supersedes_requires_archived_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"),
+                 "new-decision", "--status", "implemented",
+                 "--supersedes", "2026-09-01-old-decision.md",
+                 "--notes-dir", str(Path(tmp) / "notes")],
+                capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("archived", r.stderr)
+
+    def test_new_note_archived_with_supersedes_emits_one_header_line_each(self):
+        """The archived and supersede lines must each appear exactly once, and the
+        scaffold must verify once sealed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {"implemented/bug-fix/2026-09-01-old-decision.md": GOOD})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"),
+                 "new-decision", "--class", "bug-fix", "--status", "archived",
+                 "--supersedes", "2026-09-01-old-decision.md",
+                 "--notes-dir", str(notes)],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            created = notes / "archived" / "bug-fix" / f"{date.today():%Y-%m-%d}-new-decision.md"
+            body = created.read_text(encoding="utf-8")
+            self.assertEqual(body.count("Archived: "), 1, body[:200])
+            self.assertEqual(body.count("Superseded-by: "), 1, body[:200])
+
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root), "--seal"],
+                capture_output=True, text=True)
+            # The scaffold's Proved: placeholder is still there, so the note is
+            # expected to fail on that alone -- not on a duplicated header line.
+            self.assertIn("placeholder", r.stdout)
+            self.assertNotIn("must be blank", r.stdout)
+
+    def test_new_note_supersedes_and_partly_are_exclusive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"),
+                 "new-decision", "--partly-supersedes", "a.md", "--supersedes", "b.md",
+                 "--status", "archived", "--notes-dir", str(Path(tmp) / "notes")],
+                capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("mutually exclusive", r.stderr)
 
     def test_snapshot_style_lock_passes(self):
         good = GOOD.replace("tests/test_login.py", "snapshots/session/login-retry/session.jsonl")
@@ -277,23 +373,6 @@ Add exponential backoff to the login retry path.
                               repo_files=())
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def test_rejected_note_missing_reason_fails(self):
-        rejected = """# Agent Note: Retry with exponential backoff
-
-Status: rejected —
-
-## Problem
-
-Retries overlap and double-submit.
-
-## Proposal
-
-Add exponential backoff to the login retry path.
-
-## Alternatives considered
-
-**Use the existing retry policy.** The shared policy already handles backoff and jitter.
-"""
     def test_rejected_note_missing_reason_fails(self):
         rejected = """# Agent Note: Retry with exponential backoff
 
@@ -417,6 +496,300 @@ Add exponential backoff to the login retry path.
                 capture_output=True, text=True)
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("manifest", r.stdout)
+
+
+class TestBindingChecks(unittest.TestCase):
+    """`path::anchor` binding, and the two heuristic warnings."""
+
+    def run_verifier(self, files, extra=None, repo_files=("tests/test_login.py",)):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for f in repo_files:
+                p = root / f
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, files)
+            return subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root)] + (extra or []),
+                capture_output=True, text=True)
+
+    def note_with_verification(self, verification):
+        return GOOD.replace(
+            "Covered by `tests/test_login.py`.\n\n"
+            "Proved: temporarily disabled the latch → the test above failed as expected, then reverted.",
+            verification)
+
+    def test_anchor_present_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text(
+                "def test_retry_after_lockout():\n    pass\n", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {"implemented/bug-fix/2026-09-08-login-retry-race.md":
+                               self.note_with_verification(
+                                   "Bound to `tests/test_login.py::test_retry_after_lockout`.\n\n"
+                                   "Proved: disabled the latch → that test failed, then reverted.")})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--strict-anchors"], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_anchor_absent_warns(self):
+        bad = self.note_with_verification(
+            "Bound to `tests/test_login.py::test_renamed_away`.\n\n"
+            "Proved: disabled the latch → that test failed, then reverted.")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": bad})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("anchor", r.stdout)
+        self.assertIn("test_renamed_away", r.stdout)
+
+    def test_anchor_absent_is_error_with_strict_anchors(self):
+        bad = self.note_with_verification(
+            "Bound to `tests/test_login.py::test_renamed_away`.\n\n"
+            "Proved: disabled the latch → that test failed, then reverted.")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": bad},
+                              extra=["--strict-anchors"])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("anchor", r.stdout)
+
+    def test_cpp_scope_operator_is_not_an_anchor(self):
+        """`std::filesystem` has no `std` file, so the token stays a plain path
+        token and the anchor check never sees it."""
+        good = self.note_with_verification(
+            "Covered by `tests/test_login.py`; the failure is in `std::filesystem::path`.\n\n"
+            "Proved: disabled the latch → the test failed, then reverted.")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("anchor", r.stdout)
+
+    def test_dotted_api_member_is_not_a_bare_file(self):
+        """`Polygon.area` must not be reported: `area` is not a source extension."""
+        good = self.note_with_verification(
+            "Covered by `tests/test_login.py`; cross-checked via `Polygon.area` and `obj.value`.\n\n"
+            "Proved: disabled the latch → the test failed, then reverted.")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("bare filename", r.stdout)
+
+    def test_dotted_class_name_is_not_a_bare_file(self):
+        good = self.note_with_verification(
+            "Covered by `tests/test_login.py`; see `CheckTool.Engine.Tests` and `R01.G.01`.\n\n"
+            "Proved: disabled the latch → the test failed, then reverted.")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("bare filename", r.stdout)
+
+    def test_unresolvable_bare_source_file_warns(self):
+        good = self.note_with_verification(
+            "Covered by `tests/test_login.py`, renamed from `OldLoginTests.cs`.\n\n"
+            "Proved: disabled the latch → the test failed, then reverted.")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("OldLoginTests.cs", r.stdout)
+
+    def test_bare_resolution_can_be_disabled(self):
+        good = self.note_with_verification(
+            "Covered by `tests/test_login.py`, renamed from `OldLoginTests.cs`.\n\n"
+            "Proved: disabled the latch → the test failed, then reverted.")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good},
+                              extra=["--no-bare-resolution"])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("OldLoginTests.cs", r.stdout)
+
+    def test_stale_test_name_warns(self):
+        good = self.note_with_verification(
+            "`tests/test_login.py` — `test_retry_after_lockout`.\n\n"
+            "Proved: disabled the latch → that test failed, then reverted.")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("test_retry_after_lockout", r.stdout)
+
+    def test_present_test_name_does_not_warn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text(
+                "def test_retry_after_lockout():\n    pass\n", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {"implemented/bug-fix/2026-09-08-login-retry-race.md":
+                               self.note_with_verification(
+                                   "`tests/test_login.py` — `test_retry_after_lockout`.\n\n"
+                                   "Proved: disabled the latch → that test failed, then reverted.")})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root)],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertNotIn("test_retry_after_lockout", r.stdout)
+
+    def test_lowercase_prose_identifier_does_not_warn(self):
+        """`read_only` / `or_default` are prose, not test names."""
+        good = self.note_with_verification(
+            "Covered by `tests/test_login.py`; the guard is `read_only` and `or_default`.\n\n"
+            "Proved: disabled the latch → the test failed, then reverted.")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("read_only", r.stdout)
+
+    def test_name_heuristic_can_be_disabled(self):
+        good = self.note_with_verification(
+            "`tests/test_login.py` — `test_retry_after_lockout`.\n\n"
+            "Proved: disabled the latch → that test failed, then reverted.")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good},
+                              extra=["--no-name-heuristic"])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("test_retry_after_lockout", r.stdout)
+
+    def test_dangling_note_reference_warns(self):
+        good = GOOD + "\nSee `2026-09-01-renamed-away.md` for the earlier decision.\n"
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("2026-09-01-renamed-away.md", r.stdout)
+
+    def test_resolving_note_reference_does_not_warn(self):
+        good = GOOD + "\nSee `2026-09-01-login-retry-race.md` for the earlier decision.\n"
+        r = self.run_verifier({
+            "implemented/bug-fix/2026-09-08-login-retry-race.md": good,
+            "implemented/bug-fix/2026-09-01-login-retry-race.md": GOOD,
+        })
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("2026-09-01-login-retry-race.md", r.stdout)
+
+
+class TestSupersedeChain(unittest.TestCase):
+    """`Superseded-by` / `Partly-superseded-by` header lines."""
+
+    def run_verifier(self, files, extra=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, files)
+            return subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root)] + (extra or []),
+                capture_output=True, text=True)
+
+    @staticmethod
+    def with_header(note, line):
+        return note.replace("Status: implemented", f"Status: implemented\n{line}", 1)
+
+    def test_partly_superseded_with_section_passes(self):
+        note = self.with_header(
+            GOOD, "Partly-superseded-by: 2026-09-09-login-retry-race.md").replace(
+            "## Verification", "## Superseded\n\nThe retry cap no longer applies.\n\n## Verification")
+        r = self.run_verifier({
+            "implemented/bug-fix/2026-09-08-login-retry-race.md": note,
+            "implemented/bug-fix/2026-09-09-login-retry-race.md": GOOD,
+        })
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_partly_superseded_without_section_fails(self):
+        note = self.with_header(GOOD, "Partly-superseded-by: 2026-09-09-login-retry-race.md")
+        r = self.run_verifier({
+            "implemented/bug-fix/2026-09-08-login-retry-race.md": note,
+            "implemented/bug-fix/2026-09-09-login-retry-race.md": GOOD,
+        })
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Superseded", r.stdout)
+
+    def test_unresolvable_supersede_target_fails(self):
+        note = self.with_header(
+            GOOD, "Partly-superseded-by: 2026-09-09-gone-away.md").replace(
+            "## Verification", "## Superseded\n\nGone.\n\n## Verification")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": note})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not resolve", r.stdout)
+
+    def test_supersede_self_reference_fails(self):
+        note = self.with_header(
+            GOOD, "Partly-superseded-by: 2026-09-08-login-retry-race.md").replace(
+            "## Verification", "## Superseded\n\nSelf.\n\n## Verification")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": note})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("itself", r.stdout)
+
+    def test_supersede_cycle_fails(self):
+        a = self.with_header(GOOD, "Partly-superseded-by: 2026-09-09-login-retry-race.md").replace(
+            "## Verification", "## Superseded\n\nA.\n\n## Verification")
+        b = self.with_header(GOOD, "Partly-superseded-by: 2026-09-08-login-retry-race.md").replace(
+            "## Verification", "## Superseded\n\nB.\n\n## Verification")
+        r = self.run_verifier({
+            "implemented/bug-fix/2026-09-08-login-retry-race.md": a,
+            "implemented/bug-fix/2026-09-09-login-retry-race.md": b,
+        })
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("cycle", r.stdout)
+
+    def test_superseded_by_outside_archive_fails(self):
+        note = self.with_header(
+            GOOD, "Superseded-by: 2026-09-09-login-retry-race.md").replace(
+            "## Verification", "## Superseded\n\nGone.\n\n## Verification")
+        r = self.run_verifier({
+            "implemented/bug-fix/2026-09-08-login-retry-race.md": note,
+            "implemented/bug-fix/2026-09-09-login-retry-race.md": GOOD,
+        })
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("archived", r.stdout)
+
+    def test_superseded_by_in_archive_passes(self):
+        archived = GOOD.replace(
+            "Status: implemented",
+            f"Status: implemented\nArchived: {date.today():%Y-%m-%d}\n"
+            "Superseded-by: 2026-09-09-login-retry-race.md", 1)
+        r = self.run_verifier({
+            "archived/bug-fix/2026-09-01-login-retry-race.md": archived,
+            "implemented/bug-fix/2026-09-09-login-retry-race.md": GOOD,
+        }, extra=["--seal"])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_unknown_supersede_kind_is_a_header_error(self):
+        note = self.with_header(GOOD, "Supersedes: 2026-09-09-login-retry-race.md")
+        r = self.run_verifier({
+            "implemented/bug-fix/2026-09-08-login-retry-race.md": note,
+            "implemented/bug-fix/2026-09-09-login-retry-race.md": GOOD,
+        })
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("blank", r.stdout)
+
+
+class TestFindNotes(unittest.TestCase):
+    def test_find_matches_body_and_prints_tests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-login-retry-race.md": GOOD,
+                "implemented/bug-fix/2026-09-09-unrelated-topic.md":
+                    GOOD.replace("Fix login retry race", "Something else entirely")
+                        .replace("Retries overlap and double-submit.", "Unrelated problem.")
+                        .replace("Serialize retries behind a latch.", "Unrelated decision.")
+                        .replace("disabled the latch", "disabled the unrelated guard"),
+            })
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--find", "latch"],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("implemented/bug-fix/2026-09-08-login-retry-race.md", r.stdout)
+            self.assertIn("tests/test_login.py", r.stdout)
+            self.assertNotIn("unrelated-topic", r.stdout)
+
+    def test_find_with_no_match_reports_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            notes = Path(tmp) / "notes"
+            write_tree(notes, {"implemented/bug-fix/2026-09-08-login-retry-race.md": GOOD})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--find", "nothing-matches-this"],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("0 note(s) matched", r.stdout)
 
 
 if __name__ == "__main__":
