@@ -6,6 +6,9 @@ Usage:
                             [--no-strict] [--allow-missing] [--seal]
                             [--strict-anchors] [--no-name-heuristic]
                             [--no-bare-resolution] [--find REGEX]
+                            [--baseline FILE [--update-baseline]]
+                            [--changed-only [--base HEAD]]
+                            [--check-install]
 
 Exit non-zero on any error. With --no-strict, a missing regression-test
 path degrades to a warning; with --allow-missing, a missing notes directory
@@ -26,6 +29,21 @@ language list. Two further checks are heuristic and therefore warnings, never
 errors: a backticked bare filename that resolves nowhere under the repo, and a
 backticked `snake_case`/`Pascal_Case` identifier that is absent from every test
 file the note cites (likely a renamed test).
+
+Noise controls (all generic, all optional, gate stays red on errors only):
+- `--baseline FILE` suppresses known warnings so a large tree can adopt the
+  gate incrementally; `--update-baseline` (re)writes FILE from the current run
+  and cannot be combined with `--changed-only`. Errors are never baselined.
+- `--changed-only [--base HEAD]` limits *warnings* to notes changed versus git
+  <base> (untracked files included); errors are always reported for the whole
+  tree. Outside a git work tree it falls back to the full tree.
+- A per-note `<!-- verify-disable: name-heuristic, bare-resolution, note-ref,
+  anchor -->` (or `all`, parsed from fence-stripped prose with inline code
+  spans removed) disables that
+  warning for that note only. `anchor` never silences the `--strict-anchors`
+  error form.
+- Bare-filename resolution prefers `git ls-files` (respects .gitignore, much
+  faster on monorepos) and falls back to a pruned directory walk.
 """
 
 import argparse
@@ -34,6 +52,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -113,6 +132,22 @@ PRUNE_DIRS = frozenset({
 })
 BARE_INDEX_CAP = 200_000
 
+# Per-note opt-out: `<!-- verify-disable: name-heuristic, bare-resolution,
+# note-ref, anchor -->` or `<!-- verify-disable: all -->`. Language neutral
+# (an HTML comment inside Markdown) and scoped to one note, so a noisy legacy
+# note does not force a global `--no-*` flag. Parsed from fence-stripped prose
+# so a fenced usage example cannot disable its own note's checks. `anchor`
+# only silences the warning form: under `--strict-anchors` a missing anchor is
+# always an error (errors are never suppressible, same as the baseline).
+DISABLE_RE = re.compile(r"<!--\s*verify-disable:\s*([A-Za-z0-9_,\s-]+)\s*-->")
+DISABLE_TOKENS = frozenset({"name-heuristic", "bare-resolution", "note-ref", "anchor", "all"})
+
+# Heuristic blob guard: only the first N chars of each cited test file feed the
+# renamed-test-name check, so a huge snapshot/fixture cannot blow up memory.
+HEURISTIC_BLOB_CAP = 1_000_000
+
+BASELINE_VERSION = 2
+
 
 def valid_date(year, month, day):
     try:
@@ -147,6 +182,93 @@ def looks_like_test_name(token):
     return token.startswith("test_") or any(c.isupper() for c in token)
 
 
+def parse_disables(text):
+    """Per-note `<!-- verify-disable: ... -->` tokens, intersected with the
+    known set so typos fail silently open (a typo must not disable checks).
+    Inline code spans are stripped first, so a backticked usage example
+    cannot disable its own note's checks (fences are stripped by the caller)."""
+    text = re.sub(r"`[^`\n]*`", "", text)
+    found = set()
+    for m in DISABLE_RE.finditer(text):
+        for tok in re.split(r"[,\s]+", m.group(1).strip().lower()):
+            if tok in DISABLE_TOKENS:
+                found.add(tok)
+    return found
+
+
+def warning_key(warning, notes, repo):
+    """Portable baseline key: run-local path prefixes become placeholders, so
+    the same baseline works across machines. Only anchored occurrences are
+    replaced (prefix followed by a path delimiter or punctuation), so a short
+    `--notes-dir notes` never rewrites the `notes` inside `test_notes.py`.
+    A trivial `.` root is skipped: relative-path output is already portable."""
+    key = warning.replace(os.sep, "/")
+    for prefix, name in ((str(notes), "$NOTES"), (str(repo), "$REPO")):
+        if not prefix or prefix == ".":
+            continue
+        norm = prefix.replace(os.sep, "/")
+        key = re.sub(re.escape(norm) + r"(?=[/:;\"'`\s]|$)", name, key)
+    return key
+
+
+def load_baseline(path):
+    """Returns a set of keys, an empty set when absent, or None when malformed.
+
+    A present but mismatched `version` is malformed (fail closed); a missing
+    `version` is accepted so hand-written v0 baselines keep working.
+    """
+    if path is None:
+        return set()
+    p = Path(path)
+    if not p.exists():
+        return set()
+    try:
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("warnings"), list):
+        return None
+    if "version" in data and data["version"] != BASELINE_VERSION:
+        return None
+    return set(w for w in data["warnings"] if isinstance(w, str))
+
+
+def get_changed_paths(repo_root, base):
+    """Absolute changed paths versus git <base> (tracked diff + untracked).
+
+    Both listings are made cwd-relative to `repo_root` (`diff --relative`,
+    `ls-files` without `--exclude-standard`) so joining them onto `repo_root`
+    is sound even when `repo_root` is a subdirectory of the work tree.
+    Untracked listing intentionally includes ignored files: this set only
+    decides warning membership, so wider is strictly more conservative (a
+    git-ignored notes dir must never silence its own warnings).
+    Returns None when git is unavailable/fails, so callers fall back to the
+    full tree instead of silently skipping notes.
+    """
+    try:
+        diff = subprocess.run(
+            ["git", "-C", str(repo_root), "diff", "--name-only",
+             "--relative", "-z", base],
+            capture_output=True, timeout=30)
+        if diff.returncode != 0:
+            return None
+        others = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "--others", "-z"],
+            capture_output=True, timeout=30)
+        if others.returncode != 0:
+            return None
+        changed = set()
+        for raw in (diff.stdout.split(b"\x00") + others.stdout.split(b"\x00")):
+            if not raw:
+                continue
+            rel = raw.decode("utf-8", "ignore")
+            if rel:
+                changed.add((Path(repo_root) / rel).resolve())
+        return changed
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 class BareIndex:
     """Lazily built basename index for bare-filename resolution. Building it walks
     the repo, so it is only built once a bare candidate actually appears, and it
@@ -157,8 +279,44 @@ class BareIndex:
         self._index = None
         self._exhausted = False
 
+    def _from_git(self):
+        """Fast path: `git ls-files` respects .gitignore and avoids walking
+        ignored build trees; falls back to a walk outside a git work tree.
+        Intentional difference: submodules/tarballs may resolve differently
+        between the two paths; warnings-only impact, fail-open."""
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(self.repo_root), "ls-files", "-z",
+                 "--cached", "--others", "--exclude-standard"],
+                capture_output=True, timeout=30)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        if out.returncode != 0:
+            return None
+        index, count = {}, 0
+        for raw in out.stdout.split(b"\x00"):
+            if not raw:
+                continue
+            name = raw.decode("utf-8", "ignore").rsplit("/", 1)[-1]
+            if not name:
+                continue
+            index[name] = True
+            count += 1
+            if count > BARE_INDEX_CAP:
+                self._exhausted = True
+                return None
+        return index
+
     def get(self):
         if self._index is None and not self._exhausted:
+            git_index = self._from_git()
+            if self._exhausted:
+                # Over the cap on the fast path: report None without paying
+                # for a second full walk that would exceed it too.
+                return None
+            if git_index is not None:
+                self._index = git_index
+                return self._index
             index, count = {}, 0
             for root, dirs, files in os.walk(self.repo_root):
                 dirs[:] = [d for d in dirs if d not in PRUNE_DIRS]
@@ -242,9 +400,17 @@ def load_manifest(notes):
     return data if isinstance(data, dict) else None
 
 
-def check_verification(path, ver, repo_root, strict, opts, bare_index):
+def check_verification(path, ver, repo_root, strict, opts, bare_index,
+                       disables=frozenset(), file_cache=None):
     """Validate a `## Verification` section. Returns (errors, warnings)."""
     errors, warnings = [], []
+    if file_cache is None:
+        file_cache = {}
+
+    def cached_text(rel):
+        if rel not in file_cache:
+            file_cache[rel] = read_text_safe(repo_root / rel)
+        return file_cache[rel]
 
     if not PROVED_RE.search(ver):
         errors.append(
@@ -277,18 +443,24 @@ def check_verification(path, ver, repo_root, strict, opts, bare_index):
         else:
             warnings.append("WARNING: " + msg)
 
-    for left, right in anchors:
-        if right not in read_text_safe(repo_root / left):
-            msg = f"{path}: anchor `{right}` not found in `{left}`"
-            if opts.strict_anchors:
-                errors.append("ERROR: " + msg)
-            else:
-                warnings.append("WARNING: " + msg)
+    if anchors:
+        anchor_disabled = "anchor" in disables or "all" in disables
+        for left, right in anchors:
+            if right not in cached_text(left):
+                msg = f"{path}: anchor `{right}` not found in `{left}`"
+                if opts.strict_anchors:
+                    # Errors are never suppressible: a per-note `anchor`
+                    # disable only silences the warning form. Clean the
+                    # binding before promoting a tree to --strict-anchors.
+                    errors.append("ERROR: " + msg)
+                elif not anchor_disabled:
+                    warnings.append("WARNING: " + msg)
 
-    if not opts.no_name_heuristic:
+    if (not opts.no_name_heuristic and "name-heuristic" not in disables
+            and "all" not in disables):
         cited = [(t, repo_root / t) for t in targets if (repo_root / t).is_file()]
         if cited:
-            blob = "\n".join(read_text_safe(f) for _, f in cited)
+            blob = "\n".join(cached_text(t)[:HEURISTIC_BLOB_CAP] for t, _ in cited)
             for token in sorted(set(NAME_RE.findall(ver))):
                 if looks_like_test_name(token) and token not in blob:
                     warnings.append(
@@ -297,8 +469,13 @@ def check_verification(path, ver, repo_root, strict, opts, bare_index):
                         f"`{cited[0][0]}::{token}` so the binding is checkable"
                     )
 
-    if not opts.no_bare_resolution:
-        bare = sorted({tok for tok, ext in BARE_FILE_RE.findall(ver) if ext in SOURCE_EXTS})
+    if (not opts.no_bare_resolution and "bare-resolution" not in disables
+            and "all" not in disables):
+        # A dangling note reference (`2026-09-01-*.md`) is reported once by the
+        # note-ref check; exclude it here so one token never yields two warnings.
+        note_refs = set(NOTE_REF_RE.findall(ver))
+        bare = sorted({tok for tok, ext in BARE_FILE_RE.findall(ver)
+                       if ext in SOURCE_EXTS and tok not in note_refs})
         if bare:
             index = bare_index.get()
             if index is None:
@@ -317,13 +494,17 @@ def check_verification(path, ver, repo_root, strict, opts, bare_index):
     return errors, warnings
 
 
-def check_file(path, lifecycle, cls, repo_root, strict, opts, bare_index, note_names=None):
+def check_file(path, lifecycle, cls, repo_root, strict, opts, bare_index,
+             note_names=None, disables=None, file_cache=None):
     """Returns (errors, warnings, supersedes)."""
     errors, warnings = [], []
     try:
         text = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as e:
         return [f"{path}: cannot read: {e}"], [], []
+
+    if disables is None:
+        disables = parse_disables("\n".join(strip_fences(text)))
 
     lines = text.splitlines()
     if len(lines) < 4:
@@ -370,11 +551,12 @@ def check_file(path, lifecycle, cls, repo_root, strict, opts, bare_index, note_n
             body = "\n".join(prose)
             ver = body.split("## Verification", 1)[1]
             ver = re.split(r"^## ", ver, maxsplit=1, flags=re.M)[0]
-            e, w = check_verification(path, ver, repo_root, strict, opts, bare_index)
+            e, w = check_verification(path, ver, repo_root, strict, opts, bare_index,
+                                      disables, file_cache)
             errors.extend(e)
             warnings.extend(w)
 
-    if note_names is not None:
+    if note_names is not None and "note-ref" not in disables and "all" not in disables:
         for ref in sorted(set(NOTE_REF_RE.findall(text))):
             if ref != path.name and ref not in note_names:
                 warnings.append(
@@ -479,6 +661,60 @@ def find_notes(notes, pattern):
     return 0
 
 
+def check_install(notes, repo):
+    """Read-only wiring self-check: the tree exists and some runner invokes it.
+
+    A packaging/release-script wiring cannot be detected generically, so the
+    gate counts a pre-commit hook or a CI config that mentions verify-notes.
+    Prints one line per check plus a verdict; returns 0 only when installed.
+    """
+    wired = True
+
+    if notes.is_dir():
+        print(f"notes dir: OK ({notes})")
+    else:
+        print(f"notes dir: MISSING ({notes}) -- create it with a one-line "
+              f"README.md so the gate has a tree on a fresh clone")
+        wired = False
+
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    try:
+        hook_ok = hook.is_file() and "verify-notes" in hook.read_text(
+            encoding="utf-8-sig", errors="ignore")
+    except OSError:
+        hook_ok = False
+    print(f"pre-commit hook: {'OK' if hook_ok else 'MISSING'} ({hook.as_posix()})")
+
+    ci_hits = []
+    workflows = repo / ".github" / "workflows"
+    if workflows.is_dir():
+        for wf in sorted(workflows.glob("*.yml")) + sorted(workflows.glob("*.yaml")):
+            try:
+                if "verify-notes" in wf.read_text(encoding="utf-8-sig", errors="ignore"):
+                    ci_hits.append(wf.relative_to(repo).as_posix())
+            except OSError:
+                continue
+    for candidate in (".gitlab-ci.yml", "azure-pipelines.yml"):
+        p = repo / candidate
+        try:
+            if p.is_file() and "verify-notes" in p.read_text(
+                    encoding="utf-8-sig", errors="ignore"):
+                ci_hits.append(candidate)
+        except OSError:
+            continue
+    print(f"CI config: {', '.join(ci_hits) if ci_hits else 'NOT FOUND'} "
+          f"(a packaging-script wiring cannot be auto-detected)")
+
+    if wired and (hook_ok or ci_hits):
+        print(f"INSTALLED: {notes} is verified by "
+              f"{'the pre-commit hook' if hook_ok else 'CI'}")
+        return 0
+    print("NOT INSTALLED: wire the gate with a pre-commit hook or a CI job "
+          "(see SKILL.md 'Installing into a repository'), then re-run "
+          "--check-install")
+    return 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--notes-dir", default=os.environ.get("NOTES_DIR", ".agents/notes"))
@@ -514,13 +750,56 @@ def main(argv=None):
         metavar="REGEX",
         help="print notes matching REGEX (title, body, or filename) and exit",
     )
+    ap.add_argument(
+        "--baseline",
+        metavar="FILE",
+        default=None,
+        help="suppress warnings listed in FILE (JSON {warnings: [...]}, "
+             "portable $NOTES/$REPO keys); errors are never baselined",
+    )
+    ap.add_argument(
+        "--update-baseline",
+        action="store_true",
+        help="write current warnings to --baseline and pass; use once to "
+             "adopt the gate incrementally, then keep the file in version control",
+    )
+    ap.add_argument(
+        "--changed-only",
+        action="store_true",
+        help="limit *warnings* to notes changed versus git <base> "
+             "(untracked included); errors always cover the whole tree",
+    )
+    ap.add_argument(
+        "--base",
+        default=None,
+        help="git ref for --changed-only (default: HEAD; ignored without "
+             "--changed-only)",
+    )
+    ap.add_argument(
+        "--check-install",
+        action="store_true",
+        help="read-only wiring self-check: report whether the notes tree and "
+             "a runner (pre-commit hook or CI config) exist, then exit",
+    )
     args = ap.parse_args(argv)
+
+    if args.update_baseline and not args.baseline:
+        ap.error("--update-baseline requires --baseline FILE")
+    if args.update_baseline and args.changed_only:
+        ap.error("--update-baseline cannot be combined with --changed-only: "
+                 "a baseline written from a partial tree would be incomplete")
+    if args.base is not None and not args.changed_only:
+        print("ignoring --base without --changed-only", file=sys.stderr)
+    base = args.base or "HEAD"
 
     notes = Path(args.notes_dir)
     repo = Path(args.repo_root)
     strict = not args.no_strict
     errors, warnings = [], []
     archived = []
+
+    if args.check_install:
+        return check_install(notes, repo)
 
     if not notes.is_dir():
         msg = f"no notes dir at {notes}"
@@ -538,7 +817,33 @@ def main(argv=None):
 
     collected, edges = [], []
     bare_index = BareIndex(repo)
+    file_cache = {}
     note_names = {p.name for p in notes.rglob("*.md")}
+
+    changed = None
+    if args.changed_only:
+        changed = get_changed_paths(repo, base)
+        if changed is None:
+            print("changed-only: git unavailable, checking the full tree",
+                  file=sys.stderr)
+
+    def warnings_for_note(md):
+        """False only when --changed-only can prove this note is untouched.
+
+        Notes outside the repo tree stay enabled (conservative: never silence
+        what git cannot see).
+        """
+        if changed is None:
+            return True
+        try:
+            resolved = md.resolve()
+        except OSError:
+            return True
+        try:
+            resolved.relative_to(repo.resolve())
+        except (OSError, ValueError):
+            return True
+        return resolved in changed
     for top in sorted(p for p in notes.iterdir() if p.name not in SKIP_NAMES):
         if not top.is_dir():
             errors.append(f"{notes}/{top.name}: unexpected file at notes root")
@@ -571,12 +876,25 @@ def main(argv=None):
                 if top.name == "archived":
                     archived.append((md, md.relative_to(notes).as_posix()))
                 e, w, supersedes = check_file(md, top.name, second.name, repo, strict, args,
-                                              bare_index, note_names)
+                                              bare_index, note_names,
+                                              file_cache=file_cache)
                 errors.extend(e)
-                warnings.extend(w)
+                if warnings_for_note(md):
+                    warnings.extend(w)
                 collected.append((md, top.name, second.name))
                 for kind, target in supersedes:
                     edges.append((md.name, kind, target, top.name))
+
+    by_basename = {}
+    for md, _lifecycle, _cls in collected:
+        by_basename.setdefault(md.name, []).append(md)
+    for name in sorted(by_basename):
+        if len(by_basename[name]) > 1:
+            dupes = ", ".join(str(p) for p in sorted(by_basename[name]))
+            errors.append(
+                f"{name}: duplicate note filename in {dupes}; basenames are "
+                f"the supersede/reference key and must be unique across the tree"
+            )
 
     errors.extend(check_supersede_graph(collected, edges))
 
@@ -600,6 +918,27 @@ def main(argv=None):
                 errors.append(f"{notes}/{rel}: archived note is not sealed (run with --seal)")
             elif manifest[rel] != note_digest(md):
                 errors.append(f"{notes}/{rel}: archived note was modified after sealing")
+
+    if args.baseline or args.update_baseline:
+        baseline = load_baseline(args.baseline)
+        if baseline is None:
+            errors.append(f"{args.baseline}: baseline must be a JSON object "
+                          f"{{version: {BASELINE_VERSION}, warnings: [...]}}")
+        elif args.update_baseline:
+            keys = sorted(warning_key(w, notes, repo) for w in warnings)
+            Path(args.baseline).write_text(
+                json.dumps({"version": BASELINE_VERSION, "warnings": keys},
+                           indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            print(f"wrote {len(keys)} warning(s) to baseline {args.baseline}")
+            warnings = []
+        else:
+            kept = [w for w in warnings
+                    if warning_key(w, notes, repo) not in baseline]
+            suppressed = len(warnings) - len(kept)
+            if suppressed:
+                print(f"suppressed {suppressed} known warning(s) via baseline "
+                      f"{args.baseline}")
+            warnings = kept
 
     for w in warnings:
         print(w)

@@ -77,9 +77,14 @@ with `--test 'tests/test_login.py::test_retry_after_lockout'`; the anchor is
 checked as a plain substring, so the grammar stays language neutral. A note
 whose decision is later replaced records that in its header
 (`Superseded-by:` / `Partly-superseded-by:`) instead of leaving a stale body as
-current authority. Run `python -m unittest discover -s regression-notes/tests`
-after changing the scripts. See the skill's `SKILL.md` for the layout, format
-rules, and the commit-gate one-liner.
+current authority. Large trees stay quiet with `--baseline FILE`
+(`--update-baseline` to adopt) and `--changed-only` for pre-commit.
+Archive in one step with `new-note.py --archive <old>.md --successor <new>.md`
+(move, header, and seal together), and prove the wiring with
+`verify-notes.py --check-install`. Run
+`python regression-notes/tests/test_verify_notes.py` after changing the
+scripts. See the skill's `SKILL.md` for the layout, format rules, and the
+commit-gate one-liner.
 
 ### windows-window-ops
 

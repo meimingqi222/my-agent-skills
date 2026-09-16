@@ -792,5 +792,460 @@ class TestFindNotes(unittest.TestCase):
             self.assertIn("0 note(s) matched", r.stdout)
 
 
+class TestGenericOptimizations(unittest.TestCase):
+    """Dedupe, per-note disable, baseline, changed-only, archived scaffold."""
+
+    def run_verifier(self, files, extra=None, repo_files=("tests/test_login.py",)):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for f in repo_files:
+                p = root / f
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, files)
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root)] + (extra or []),
+                capture_output=True, text=True)
+            return r
+
+    def test_archived_scaffold_uses_implemented_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"),
+                 "arch-topic", "--class", "bug-fix", "--status", "archived",
+                 "--test", "tests/test_login.py",
+                 "--notes-dir", str(notes)],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            created = list(notes.rglob("*.md"))
+            self.assertEqual(len(created), 1)
+            lines = created[0].read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[2], "Status: implemented")
+            self.assertTrue(lines[3].startswith("Archived: "))
+
+    def test_dangling_note_warns_once(self):
+        good = GOOD + "\nSee `2026-09-01-renamed-away.md` for the earlier decision.\n"
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.count("2026-09-01-renamed-away.md"), 1)
+        self.assertIn("references note", r.stdout)
+        self.assertNotIn("bare filename", r.stdout)
+
+    def test_per_note_disable(self):
+        good = (GOOD + "\nSee `2026-09-01-renamed-away.md`.\n\n"
+                "<!-- verify-disable: note-ref, bare-resolution -->\n")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("2026-09-01-renamed-away.md", r.stdout)
+
+    def test_baseline_update_and_suppress(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-login-retry-race.md":
+                    GOOD + "\nSee `2026-09-01-renamed-away.md`.\n"})
+            base = root / "baseline.json"
+            r1 = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--baseline", str(base), "--update-baseline"],
+                capture_output=True, text=True)
+            self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
+            data = json.loads(base.read_text(encoding="utf-8"))
+            self.assertIn("warnings", data)
+            self.assertTrue(data["warnings"])
+            # Portable keys: no absolute temp path leaks into the baseline.
+            self.assertNotIn(str(root), json.dumps(data))
+            r2 = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--baseline", str(base)],
+                capture_output=True, text=True)
+            self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+            self.assertNotIn("WARNING", r2.stdout)
+
+    def test_changed_only_limits_warnings_but_not_errors(self):
+        import shutil
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True,
+                           capture_output=True)
+            subprocess.run(["git", "config", "user.email", "t@t"],
+                           cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "t"],
+                           cwd=root, check=True, capture_output=True)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-a.md":
+                    GOOD + "\nSee `2026-09-01-gone-a.md`.\n",
+                "implemented/bug-fix/2026-09-08-b.md": GOOD,
+            })
+            subprocess.run(["git", "add", "."], cwd=root, check=True,
+                           capture_output=True)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True,
+                           capture_output=True)
+            (notes / "implemented" / "bug-fix" / "2026-09-08-b.md").write_text(
+                GOOD + "\nSee `2026-09-02-gone-b.md`.\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True,
+                           capture_output=True)
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--changed-only", "--base", "HEAD"],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertNotIn("2026-09-01-gone-a.md", r.stdout)
+            self.assertIn("2026-09-02-gone-b.md", r.stdout)
+
+    def test_changed_only_subdir_repo_root(self):
+        import shutil
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            top = Path(tmp)
+            sub = top / "sub"
+            notes = sub / "notes"
+            (sub / "tests").mkdir(parents=True)
+            (sub / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-a.md": GOOD,
+                "implemented/bug-fix/2026-09-08-b.md": GOOD,
+            })
+            for args in (["git", "init", "-q"],
+                         ["git", "config", "user.email", "t@t"],
+                         ["git", "config", "user.name", "t"]):
+                subprocess.run(args, cwd=top, check=True, capture_output=True)
+            subprocess.run(["git", "add", "."], cwd=top, check=True,
+                           capture_output=True)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=top, check=True,
+                           capture_output=True)
+            # Tracked change inside the subdir repo-root: must stay visible.
+            (notes / "implemented" / "bug-fix" / "2026-09-08-a.md").write_text(
+                GOOD + "\nSee `2026-09-01-gone-sub.md`.\n", encoding="utf-8")
+            # Untracked note in the same subdir: must stay visible too.
+            (notes / "implemented" / "bug-fix" / "2026-09-08-c.md").write_text(
+                GOOD + "\nSee `2026-09-02-gone-new.md`.\n", encoding="utf-8")
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(sub),
+                 "--changed-only", "--base", "HEAD"],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("2026-09-01-gone-sub.md", r.stdout)
+            self.assertIn("2026-09-02-gone-new.md", r.stdout)
+
+    def test_changed_only_gitignored_notes_still_warn(self):
+        import shutil
+        if shutil.which("git") is None:
+            self.skipTest("git not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for args in (["git", "init", "-q"],
+                         ["git", "config", "user.email", "t@t"],
+                         ["git", "config", "user.name", "t"]):
+                subprocess.run(args, cwd=root, check=True, capture_output=True)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            (root / ".gitignore").write_text("notes-ignored/\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True,
+                           capture_output=True)
+            subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True,
+                           capture_output=True)
+            notes = root / "notes-ignored"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-a.md":
+                    GOOD + "\nSee `2026-09-01-gone-ignored.md`.\n"})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--changed-only", "--base", "HEAD"],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("2026-09-01-gone-ignored.md", r.stdout)
+
+    def test_anchor_disable_is_warning_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text(
+                "def test_present():\n    pass\n", encoding="utf-8")
+            notes = root / "notes"
+            body = GOOD.replace(
+                "Covered by `tests/test_login.py`.",
+                "Bound to `tests/test_login.py::test_missing`.")
+            body += "\n<!-- verify-disable: anchor -->\n"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-login-retry-race.md": body})
+            plain = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root)],
+                capture_output=True, text=True)
+            self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
+            self.assertNotIn("anchor", plain.stdout)
+            strict = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--strict-anchors"],
+                capture_output=True, text=True)
+            self.assertNotEqual(strict.returncode, 0)
+            self.assertIn("anchor", strict.stdout)
+
+    def test_fenced_disable_comment_is_ignored(self):
+        good = (GOOD + "\nSee `2026-09-01-gone-fenced.md`.\n\n"
+                "```\n<!-- verify-disable: all -->\n```\n")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("2026-09-01-gone-fenced.md", r.stdout)
+
+    def test_update_baseline_with_changed_only_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-login-retry-race.md": GOOD})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--baseline", str(root / "b.json"), "--update-baseline",
+                 "--changed-only"],
+                capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("changed-only", r.stderr)
+
+    def test_baseline_version_check(self):
+        import json
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-login-retry-race.md": GOOD})
+            bad = root / "bad.json"
+            bad.write_text(json.dumps({"version": 999, "warnings": []}),
+                           encoding="utf-8")
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--baseline", str(bad)],
+                capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("baseline", r.stdout)
+            legacy = root / "legacy.json"
+            legacy.write_text(json.dumps({"warnings": []}), encoding="utf-8")
+            r2 = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--baseline", str(legacy)],
+                capture_output=True, text=True)
+            self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
+
+    def test_supersedes_help_names_successor(self):
+        r = subprocess.run(
+            [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"), "--help"],
+            capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("successor", r.stdout)
+        self.assertIn("Superseded-by", r.stdout)
+
+    def test_inline_code_span_disable_is_ignored(self):
+        good = (GOOD + "\nSee `2026-09-01-gone-inline.md`.\n\n"
+                "`<!-- verify-disable: all -->`\n")
+        r = self.run_verifier({"implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("2026-09-01-gone-inline.md", r.stdout)
+
+    def test_warning_key_short_prefix(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "verify_notes", SKILL_DIR / "scripts" / "verify-notes.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        key = module.warning_key(
+            "WARNING: notes/implemented/bug-fix/2026-09-08-a.md: "
+            "see `tests/test_notes.py`",
+            Path("notes"), Path("."))
+        self.assertTrue(key.startswith("WARNING: $NOTES/"), key)
+        self.assertIn("test_notes.py", key)
+
+
+class TestArchiveFlow(unittest.TestCase):
+    """One-step archive, duplicate basenames, translations, install check."""
+
+    def test_archive_moves_adds_header_and_seals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-01-old-decision.md": GOOD,
+                "implemented/bug-fix/2026-09-09-new-decision.md": GOOD,
+            })
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"),
+                 "--archive", "2026-09-01-old-decision.md",
+                 "--by", "2026-09-09-new-decision.md",
+                 "--notes-dir", str(notes), "--repo-root", str(root)],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            dst = notes / "archived" / "bug-fix" / "2026-09-01-old-decision.md"
+            self.assertFalse(
+                (notes / "implemented" / "bug-fix" / "2026-09-01-old-decision.md").exists())
+            lines = dst.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[2], "Status: implemented")
+            self.assertTrue(lines[3].startswith("Archived: "))
+            self.assertEqual(lines[4], "Superseded-by: 2026-09-09-new-decision.md")
+            self.assertTrue((notes / "archived" / "manifest.json").exists())
+            v = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root)],
+                capture_output=True, text=True)
+            self.assertEqual(v.returncode, 0, v.stdout + v.stderr)
+
+    def test_archive_missing_old_fails_without_touching_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-09-new-decision.md": GOOD})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"),
+                 "--archive", "2026-09-01-nope.md",
+                 "--successor", "2026-09-09-new-decision.md",
+                 "--notes-dir", str(notes)],
+                capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertTrue(
+                (notes / "implemented" / "bug-fix" / "2026-09-09-new-decision.md").exists())
+            self.assertFalse((notes / "archived").exists())
+
+    def test_archive_missing_successor_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-01-old-decision.md": GOOD})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "new-note.py"),
+                 "--archive", "2026-09-01-old-decision.md",
+                 "--successor", "2026-09-09-gone.md",
+                 "--notes-dir", str(notes)],
+                capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("successor", r.stderr)
+            self.assertTrue(
+                (notes / "implemented" / "bug-fix" / "2026-09-01-old-decision.md").exists())
+
+    def test_duplicate_basename_fails(self):
+        feature = GOOD.replace(
+            "Covered by `tests/test_login.py`.\n\n"
+            "Proved: temporarily disabled the latch \u2192 the test above failed as expected, then reverted.",
+            "No test binding needed for non-bug-fix classes.")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-same-name.md": GOOD,
+                "implemented/feature/2026-09-08-same-name.md": feature,
+            })
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root)],
+                capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("duplicate", r.stdout)
+
+    def test_zh_translation_sibling_is_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-login-retry-race.md": GOOD,
+                "implemented/bug-fix/2026-09-08-login-retry-race.zh.md":
+                    "garbage, not a note at all\n",
+            })
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root)],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_check_install_ok_and_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-login-retry-race.md": GOOD})
+            hook = root / ".git" / "hooks" / "pre-commit"
+            hook.parent.mkdir(parents=True)
+            hook.write_text(
+                "#!/bin/sh\npython3 regression-notes/scripts/verify-notes.py "
+                "--notes-dir .agents/notes || exit 1\n", encoding="utf-8")
+            run = lambda: subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--check-install"],
+                capture_output=True, text=True)
+            ok = run()
+            self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+            self.assertIn("INSTALLED", ok.stdout)
+            hook.unlink()
+            missing = run()
+            self.assertNotEqual(missing.returncode, 0)
+            self.assertIn("NOT INSTALLED", missing.stdout)
+
+    def test_base_without_changed_only_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-login-retry-race.md": GOOD})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root),
+                 "--base", "HEAD"],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("ignoring --base", r.stderr)
+
+    def test_nospace_disable_comment_works(self):
+        good = (GOOD + "\nSee `2026-09-01-gone-nospace.md`.\n\n"
+                "<!-- verify-disable:note-ref-->")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text("x", encoding="utf-8")
+            notes = root / "notes"
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-login-retry-race.md": good})
+            r = subprocess.run(
+                [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+                 "--notes-dir", str(notes), "--repo-root", str(root)],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertNotIn("2026-09-01-gone-nospace.md", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

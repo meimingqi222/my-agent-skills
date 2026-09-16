@@ -19,7 +19,7 @@ allowed-tools: Bash(${CLAUDE_SKILL_DIR}/scripts/verify-notes.py *), Bash(${CLAUD
 
 # Regression notes
 
-Version 0.2.0
+Version 0.4.0
 
 Use `python` or `py -3` when `python3` is unavailable (stock Windows).
 
@@ -52,13 +52,24 @@ Then give the gate something that actually runs it. A rule in a prose file is a 
 ```sh
 # 2. A pre-commit hook -- the common case, since most repositories have no CI
 #!/bin/sh
-# .git/hooks/pre-commit   (chmod +x it)
-python3 regression-notes/scripts/verify-notes.py --notes-dir .agents/notes || exit 1
+# .git/hooks/pre-commit   (chmod +x it; on Windows run hooks under Git Bash,
+# where `python3` may be missing and the `py` launcher stands in)
+if command -v python3 >/dev/null 2>&1; then
+  python3 regression-notes/scripts/verify-notes.py --notes-dir .agents/notes || exit 1
+else
+  py -3 regression-notes/scripts/verify-notes.py --notes-dir .agents/notes || exit 1
+fi
 ```
 
 ```sh
 # 3. Inside an existing packaging/release script, where the tree may be absent
 python3 regression-notes/scripts/verify-notes.py --notes-dir .agents/notes --allow-missing
+```
+
+Then prove the wiring (read-only; a packaging-script wiring cannot be auto-detected, so the gate counts a hook or a CI config):
+
+```bash
+python3 regression-notes/scripts/verify-notes.py --notes-dir .agents/notes --check-install
 ```
 
 **You have not installed this skill until you can name the command that runs the verifier without an agent deciding to.** If the answer is "the agent runs it when it remembers", the gate does not exist — that is the failure this skill was built to prevent.
@@ -204,28 +215,54 @@ Rules the verifier enforces:
   - at least one backticked test path that exists (`--no-strict` degrades a missing target to a warning), and
   - a `Proved:` line recording that the regression test was seen to fail before the fix and to pass after; the line must not still carry the template placeholder.
 - Supersede pointers resolve, are not self-references, and form no cycle (see above).
+- Note basenames must be unique across the whole tree: `Superseded-by` and note references address notes by basename, so `bug-fix/2026-01-01-x.md` and `feature/2026-01-01-x.md` side by side are an error.
 - Filenames must encode a valid calendar date and not be in the future.
-- Only `.md` files live in the notes tree.
+- Only `.md` files live in the notes tree. A `*.zh.md` sibling is allowed as the translation of its canonical note and is skipped by the gate (no format checks); keep it next to the note it translates so the pair stays in sync.
 - Every archived note must be sealed in `archived/manifest.json`; a sealed note that is later modified or deleted fails verification.
 
 Warnings (never errors — each is a heuristic, so it is advisory):
 
 - A cited `snake_case`/`Pascal_Case` identifier that appears in no test file the note cites — likely a renamed test. Disable with `--no-name-heuristic`.
-- A backticked bare source filename (`OldTests.cs`) that resolves nowhere under the repo. Disable with `--no-bare-resolution`.
+- A backticked bare source filename (`OldTests.cs`) that resolves nowhere under the repo. Disable with `--no-bare-resolution`. Date-prefixed note filenames are excluded here so one token never yields two warnings.
 - A backticked note filename that is not in the tree — a renamed or deleted note.
-- A `path::anchor` whose anchor is missing from that file. Promote to an error with `--strict-anchors` once a repository's bindings are clean.
+- A `path::anchor` whose anchor is missing from that file. Promote to an error with `--strict-anchors` once a repository's bindings are clean. A per-note `anchor` disable only silences the warning form, never the `--strict-anchors` error.
+
+Keep the gate quiet without weakening it (all generic, all optional; errors always cover the whole tree):
+
+```bash
+# Per-note opt-out for one noisy legacy note (does not affect other notes;
+# parsed from fence-stripped prose with inline code spans removed, so a fenced
+# or backticked usage example cannot disable its own note's checks):
+# <!-- verify-disable: name-heuristic, bare-resolution, note-ref, anchor -->
+# <!-- verify-disable: all -->
+
+# Adopt incrementally: record today's warnings, keep the file in version control
+# (--update-baseline cannot be combined with --changed-only: a partial-tree
+# baseline would be incomplete)
+python3 "$SCRIPTS/verify-notes.py" --notes-dir <notes-dir> --baseline .agents/notes-baseline.json --update-baseline
+python3 "$SCRIPTS/verify-notes.py" --notes-dir <notes-dir> --baseline .agents/notes-baseline.json
+
+# pre-commit: warnings only for notes changed versus HEAD (untracked included)
+python3 "$SCRIPTS/verify-notes.py" --notes-dir <notes-dir> --changed-only
+# nightly/CI: full warnings, optionally with --strict-anchors
+python3 "$SCRIPTS/verify-notes.py" --notes-dir <notes-dir> --strict-anchors
+```
+
+`--changed-only [--base HEAD]` falls back to the full tree outside a git work tree. Paths are resolved relative to `--repo-root`, so a subdir repo-root sees its own subtree; git-ignored notes stay warning-enabled (conservative). Bare-filename resolution prefers `git ls-files` (respects `.gitignore`, much faster on monorepos) and falls back to a pruned walk.
 
 ## Sealing the archive
 
-The archive freeze is machine-checked, not a convention. When a note moves to `archived/`, seal it in the same change:
+The archive freeze is machine-checked, not a convention. Archive in one step — move, header, and seal together:
 
 ```bash
-python3 "$SCRIPTS/verify-notes.py" --seal
+python3 "$SCRIPTS/new-note.py" --archive 2026-09-01-old-decision.md --successor 2026-09-09-new-decision.md --notes-dir <notes-dir>
 ```
+
+`--archive` moves the implemented note to `archived/`, inserts `Archived:` plus `Superseded-by:`, then verifies and seals. `--by` is an alias of `--successor`. The manual equivalent is: move the file, add the two header lines, then run `verify-notes.py --seal` in the same change.
 
 `--seal` verifies the tree, then records each archived note's SHA-256 in `archived/manifest.json`. The manifest is append-only: `--seal` adds missing entries and refuses to rewrite a recorded hash, so a note that was modified after sealing stays red — fix forward with a new note instead of editing history. Plain verification, including the gate one-liner, fails on any archived note that is unsealed, modified, or deleted.
 
-Archive a note only when it is fully superseded and its successor carries the consolidated rationale. `--seal` is the last step: move the note, add its `Superseded-by` pointer, then seal. Once sealed the note is frozen, so a `Superseded-by` pointer added afterwards can never be corrected — get the pointer right before sealing.
+Archive a note only when it is fully superseded and its successor carries the consolidated rationale. Once sealed the note is frozen, so a `Superseded-by` pointer added afterwards can never be corrected — get the pointer right before sealing (the `--archive` command above gets this order right by construction).
 
 ## Keep the corpus current
 
@@ -235,7 +272,7 @@ Before creating a note, search the tree for an existing note that owns the same 
 
 When a later decision replaces an earlier one, record the link in the header so the old note cannot be read as current authority:
 
-- **Fully superseded** — consolidate the unique rationale, alternatives, consequences, and verification into the new owner, add `Superseded-by: <successor>.md` to the old note, and move it to `archived/` (then `--seal`). The old note keeps its history; the pointer says who owns the decision now.
+- **Fully superseded** — consolidate the unique rationale, alternatives, consequences, and verification into the new owner, then run `new-note.py --archive <old>.md --successor <new>.md` (moves to `archived/`, adds `Superseded-by:`, seals). The old note keeps its history; the pointer says who owns the decision now.
 - **Partly superseded** — the successor covers one branch, and the rest still holds. Add `Partly-superseded-by: <successor>.md` and a `## Superseded` section saying which part is dead. Leave the note in `implemented/`: it is still live authority for the rest.
 
 Do not leave a partly replaced decision recorded only as an inline remark in the body — that is how a superseded `## Consequences` section keeps asserting behavior the code no longer has. The header pointer and the `## Superseded` section are what make the stale part legible.
@@ -273,7 +310,7 @@ The binding and staleness checks are existence checks, not proofs. An anchor tha
 Run the suite after any change to `scripts/`:
 
 ```bash
-python -m unittest discover -s regression-notes/tests
+python regression-notes/tests/test_verify_notes.py
 ```
 
-New checks must be **warnings** unless they are provably free of false positives across languages and layouts. Errors are reserved for structural facts the grammar fully determines (a missing file, a malformed header, an unresolvable pointer). Anything shaped like a language convention — test naming, symbol resolution, module layout — is a warning with an opt-out flag, because a check that misfires on a correct tree teaches people to ignore the gate.
+New checks must be **warnings** unless they are provably free of false positives across languages and layouts. Errors are reserved for structural facts the grammar fully determines (a missing file, a malformed header, an unresolvable pointer). Anything shaped like a language convention — test naming, symbol resolution, module layout — is a warning with an opt-out flag, because a check that misfires on a correct tree teaches people to ignore the gate. Keep optimizations generic: no language list, no required tooling beyond stock Python (git is an optional fast path with a walk fallback), no per-project config.
