@@ -19,7 +19,7 @@ allowed-tools: Bash(${CLAUDE_SKILL_DIR}/scripts/verify-notes.py *), Bash(${CLAUD
 
 # Regression notes
 
-Version 0.4.0
+Version 0.4.3
 
 Use `python` or `py -3` when `python3` is unavailable (stock Windows).
 
@@ -35,6 +35,8 @@ The skill only works if it is required, not merely available. Add this standing 
 ## Regression notes
 
 Every non-trivial bug fix ships one regression note and one regression test in the same change. The note records the problem, the decision, the alternatives considered, and the consequences; the test pins the behavior. A `## Verification` section names the test path and records the red-run proof.
+
+Before editing a file, run `verify-notes.py --notes-dir .agents/notes --for-path <paths>` and read any note that cites it — the reverse lookup is what makes the notes tripwires instead of an archive.
 
 Trivial mechanical edits with no behavior change are exempt.
 
@@ -73,6 +75,11 @@ python3 regression-notes/scripts/verify-notes.py --notes-dir .agents/notes --che
 ```
 
 **You have not installed this skill until you can name the command that runs the verifier without an agent deciding to.** If the answer is "the agent runs it when it remembers", the gate does not exist — that is the failure this skill was built to prevent.
+
+Two rules keep the wiring useful without slowing development down:
+
+- **Docs carry pointers, never content.** `AGENTS.md`/`CLAUDE.md` get the standing rule and the `--for-path` usage — nothing else. Decision details, pitfall summaries, and test names live in the notes tree; every copy pasted into an agent doc is a second ledger that drifts (a real failure mode: an inline pitfalls table in `AGENTS.md` whose numbering silently diverged from the canonical list). When the same fact wants to live in two places, one of them must be a link.
+- **Checks are fast or they get bypassed.** `--for-path`, `--find`, and the verifier all run in well under a second and need nothing beyond stock Python — keep it that way. In pre-commit, run `--for-path` as a non-blocking reminder on staged files and let CI hold the blocking verification; a hook that compiles the world teaches people `git commit --no-verify`. The expensive-but-honest step (intersecting `--dump-anchors` with the real test list) belongs in CI where the test binary already exists, never in a hook.
 
 You can either vendor this skill under `regression-notes/` in the target repository, or install it in CI and point `--notes-dir` at the repo's note tree. Git does not track empty directories: commit a one-line `.agents/notes/README.md` (the verifier skips it) so the gate has a tree to verify on a fresh clone before the first note exists.
 
@@ -214,9 +221,10 @@ Rules the verifier enforces:
 - `bug-fix` in `implemented/` or `archived/` requires `## Verification` with:
   - at least one backticked test path that exists (`--no-strict` degrades a missing target to a warning), and
   - a `Proved:` line recording that the regression test was seen to fail before the fix and to pass after; the line must not still carry the template placeholder.
+- Machine-absolute tokens — registry hives (`HKLM\...`, `HKEY_CURRENT_USER\...`), drive paths (`C:\...`), UNC/verbatim paths, POSIX roots, `%VAR%` paths, and `scheme://` URLs — are never test targets: a note citing them in prose is describing the world, not binding a test.
 - Supersede pointers resolve, are not self-references, and form no cycle (see above).
 - Note basenames must be unique across the whole tree: `Superseded-by` and note references address notes by basename, so `bug-fix/2026-01-01-x.md` and `feature/2026-01-01-x.md` side by side are an error.
-- Filenames must encode a valid calendar date and not be in the future.
+- Filenames must encode a valid calendar date and not be future everywhere: date-only filenames and archive dates are bounded by the current civil date at UTC+14, independent of the runner timezone.
 - Only `.md` files live in the notes tree. A `*.zh.md` sibling is allowed as the translation of its canonical note and is skipped by the gate (no format checks); keep it next to the note it translates so the pair stays in sync.
 - Every archived note must be sealed in `archived/manifest.json`; a sealed note that is later modified or deleted fails verification.
 
@@ -225,7 +233,7 @@ Warnings (never errors — each is a heuristic, so it is advisory):
 - A cited `snake_case`/`Pascal_Case` identifier that appears in no test file the note cites — likely a renamed test. Disable with `--no-name-heuristic`.
 - A backticked bare source filename (`OldTests.cs`) that resolves nowhere under the repo. Disable with `--no-bare-resolution`. Date-prefixed note filenames are excluded here so one token never yields two warnings.
 - A backticked note filename that is not in the tree — a renamed or deleted note.
-- A `path::anchor` whose anchor is missing from that file. Promote to an error with `--strict-anchors` once a repository's bindings are clean. A per-note `anchor` disable only silences the warning form, never the `--strict-anchors` error.
+- A `path::anchor` whose anchor is missing from that file. Promote to an error with `--strict-anchors` once a repository's bindings are clean. A per-note `anchor` disable only silences the warning form, never the `--strict-anchors` error. `--dump-anchors` (and therefore the CI test-list intersection) skips `archived/` notes: they are sealed and frozen, so they cannot be edited to follow a renamed or retired test, and their history may legitimately name tests that were later removed.
 
 Keep the gate quiet without weakening it (all generic, all optional; errors always cover the whole tree):
 
@@ -260,7 +268,7 @@ python3 "$SCRIPTS/new-note.py" --archive 2026-09-01-old-decision.md --successor 
 
 `--archive` moves the implemented note to `archived/`, inserts `Archived:` plus `Superseded-by:`, then verifies and seals. `--by` is an alias of `--successor`. The manual equivalent is: move the file, add the two header lines, then run `verify-notes.py --seal` in the same change.
 
-`--seal` verifies the tree, then records each archived note's SHA-256 in `archived/manifest.json`. The manifest is append-only: `--seal` adds missing entries and refuses to rewrite a recorded hash, so a note that was modified after sealing stays red — fix forward with a new note instead of editing history. Plain verification, including the gate one-liner, fails on any archived note that is unsealed, modified, or deleted.
+`--seal` verifies the tree, then records each archived note's SHA-256 in `archived/manifest.json`, naming every entry it seals. The digest is computed over **LF-normalised** content, so a checkout's line endings (`core.autocrlf` on Windows) never look like a modification. The manifest is append-only: `--seal` adds missing entries and refuses to rewrite a recorded hash, so a note that was modified after sealing stays red — fix forward with a new note instead of editing history. `--reseal` is the explicit escape hatch for **tooling migrations** (a digest-algorithm change, an EOL-normalisation rollout): it rewrites the entries whose digest no longer matches and prints each one, so the rewrite is visible in review. Plain verification, including the gate one-liner, fails on any archived note that is unsealed, modified, or deleted.
 
 Archive a note only when it is fully superseded and its successor carries the consolidated rationale. Once sealed the note is frozen, so a `Superseded-by` pointer added afterwards can never be corrected — get the pointer right before sealing (the `--archive` command above gets this order right by construction).
 
@@ -293,7 +301,18 @@ The anchor is checked as a plain substring of that file. That is the whole gramm
 
 Prefer the anchored form: a bare `tests/test_login.py` proves the file exists, not that the test does. If you cite a test by name anywhere in `## Verification` without an anchor, the verifier warns, because it cannot tell a renamed test from prose.
 
-A guard only guards if the regression fails it. Before submitting, prove it: temporarily reintroduce the bug (or stub the fix), watch the bound test go red, then revert. Record the red run in the `Proved:` line under `## Verification` (e.g. `Proved: disabled the latch → tests/test_login.py::test_retry_after_lockout failed as expected, then reverted`). A test you have never seen fail is a self-report, not a lock — assert against the world (re-run the command, re-read the file from outside), never against the agent's own output.
+A guard only guards if the regression fails it, and the failure must land on the assertion the binding names: a fixture, environment, or compile error does not prove anything, so fix the setup and re-run until the bound assertion fails for the expected reason.
+
+Two kinds of evidence count, and they share one record:
+
+- **Natural red** — a failure you actually observed: the test written before the fix (TDD), or the suite's real failure before the patch landed. This satisfies the proof outright; you do not owe a second manufactured run. The `Proved:` line must cite something checkable, e.g. `Proved: pre-fix run failed at <assertion>; output saved to <evidence-log>` — "it was red earlier" without a log or output is the self-report this line exists to kill.
+- **Manufactured red** — needed only when the test was written after the fix and has never been observed to fail. Keep it cheap and reversible: disable **one** guard, run only the bound test (focused, e.g. `cargo test --lib <name>`), save the failing output, restore the guard, then re-run the same focused test green — the restore-and-regreen is part of the ritual, not an option. One manufactured run may cover every test bound to the same guard; tests bound to different guards each need their own.
+
+Record the red run in the `Proved:` line under `## Verification` (e.g. `Proved: disabled the latch → tests/test_login.py::test_retry_after_lockout failed as expected, then reverted; output saved to .agents/notes-evidence/login-retry-red.log`). Put evidence under a committed directory — a sibling of the notes tree (convention: `<notes>-evidence/`), since the notes tree itself accepts only `.md` — rather than a build output dir like `target/` that gets cleaned or gitignored. Backticked paths on `Proved:` lines are treated as evidence, not test targets: they never fail verification, but a missing evidence file warns, so a `Proved:` line whose proof evaporates on `cargo clean` stops passing silently. Assert against the world (re-run the command, re-read the file from outside), never against the agent's own output.
+
+Notes earn nothing sitting unread. `--for-path` is the reverse lookup: pass the files you are about to change and get back the notes citing them. Wire it where edits start — a repo rule ("run `--for-path` on changed files before editing"), a pre-commit hook printing citing notes, or both — because a reminder that runs without anyone remembering it is worth more than a ritual that depends on recall. For repos whose tests list themselves (`cargo test -- --list`, `pytest --collect-only`), a CI step can intersect `--dump-anchors` output with the real list to catch a renamed test that survives as an orphan substring.
+
+The gate verifies notes that exist; it cannot see fixes that never got one. `--audit-commits [N]` closes that gap from the history side: it flags recent commits whose message looks like a fix and that touched code but added neither a note nor a test file. It is a report, not a gate — run it on a schedule or after a bug-fixing session and treat flagged commits as candidates for retroactive notes.
 
 ## When to write a postmortem
 
@@ -307,10 +326,10 @@ The binding and staleness checks are existence checks, not proofs. An anchor tha
 
 ## Changing the verifier
 
-Run the suite after any change to `scripts/`:
+Run the suite after any change to `scripts/`. On Windows, set `PYTHONUTF8=1` for the test process so its Python subprocesses also use UTF-8; `-X utf8` alone does not propagate to child interpreters:
 
 ```bash
-python regression-notes/tests/test_verify_notes.py
+python -X utf8 -m unittest discover -s regression-notes/tests
 ```
 
 New checks must be **warnings** unless they are provably free of false positives across languages and layouts. Errors are reserved for structural facts the grammar fully determines (a missing file, a malformed header, an unresolvable pointer). Anything shaped like a language convention — test naming, symbol resolution, module layout — is a warning with an opt-out flag, because a check that misfires on a correct tree teaches people to ignore the gate. Keep optimizations generic: no language list, no required tooling beyond stock Python (git is an optional fast path with a walk fallback), no per-project config.

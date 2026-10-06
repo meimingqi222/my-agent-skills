@@ -293,7 +293,8 @@ class TestVerifyNotes(unittest.TestCase):
         r = self.run_verifier({"archived/bug-fix/2026-09-01-login-retry-race.md": ARCHIVED_GOOD},
                               extra=["--seal"])
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("sealed 1 archived note(s)", r.stdout)
+        # Each sealed entry is named, so a re-seal in review shows exactly what moved.
+        self.assertIn("sealed archived/bug-fix/2026-09-01-login-retry-race.md", r.stdout)
 
     def test_unsealed_archived_note_fails(self):
         r = self.run_verifier({"archived/bug-fix/2026-09-01-login-retry-race.md": ARCHIVED_GOOD})
@@ -1245,6 +1246,93 @@ class TestArchiveFlow(unittest.TestCase):
                 capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertNotIn("2026-09-01-gone-nospace.md", r.stdout)
+
+
+class TestSealDigestAndArchivedAnchors(unittest.TestCase):
+    """Digest stability across checkouts, the --reseal migration path, and the
+    archived exemption from live test-anchor binding."""
+
+    def tree(self, tmp):
+        root = Path(tmp)
+        (root / "tests").mkdir()
+        (root / "tests" / "test_login.py").write_text(
+            "def test_retry_after_lockout():\n    pass\n", encoding="utf-8")
+        notes = root / "notes"
+        write_tree(notes, {"archived/bug-fix/2026-09-01-login-retry-race.md": ARCHIVED_GOOD})
+        return root, notes
+
+    def run_verifier(self, notes, root, *extra):
+        return subprocess.run(
+            [sys.executable, str(SKILL_DIR / "scripts" / "verify-notes.py"),
+             "--notes-dir", str(notes), "--repo-root", str(root), *extra],
+            capture_output=True, text=True)
+
+    def test_digest_ignores_line_endings(self):
+        """A checkout's line endings are not a modification: the seal hashes
+        LF-normalised content, so a CRLF working tree verifies against a manifest
+        sealed elsewhere (and vice versa)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, notes = self.tree(tmp)
+            note = notes / "archived" / "bug-fix" / "2026-09-01-login-retry-race.md"
+            # Byte-exact writes, not write_text: on Windows that helper translates
+            # newlines, which would make both halves CRLF and hide the defect.
+            note.write_bytes(ARCHIVED_GOOD.replace("\n", "\r\n").encode("utf-8"))
+            sealed = self.run_verifier(notes, root, "--seal")
+            self.assertEqual(sealed.returncode, 0, sealed.stdout + sealed.stderr)
+
+            note.write_bytes(ARCHIVED_GOOD.encode("utf-8"))
+            verified = self.run_verifier(notes, root)
+            self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+
+    def test_seal_never_rewrites_but_reseal_migrates(self):
+        """--seal is append-only (a tampered note stays red and the manifest is
+        untouched); --reseal is the explicit tooling-migration path and names
+        every entry it rewrites."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root, notes = self.tree(tmp)
+            note = notes / "archived" / "bug-fix" / "2026-09-01-login-retry-race.md"
+            manifest = notes / "archived" / "manifest.json"
+            self.assertEqual(self.run_verifier(notes, root, "--seal").returncode, 0)
+            before = manifest.read_bytes()
+
+            note.write_text(ARCHIVED_GOOD + "\nTampered.\n", encoding="utf-8")
+            still_red = self.run_verifier(notes, root, "--seal")
+            self.assertNotEqual(still_red.returncode, 0)
+            self.assertEqual(manifest.read_bytes(), before)
+
+            migrated = self.run_verifier(notes, root, "--reseal")
+            self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+            self.assertIn(
+                "resealed archived/bug-fix/2026-09-01-login-retry-race.md", migrated.stdout)
+            self.assertNotEqual(manifest.read_bytes(), before)
+            self.assertEqual(self.run_verifier(notes, root).returncode, 0)
+
+    def test_dump_anchors_skips_archived_notes(self):
+        """Archived notes are frozen and sealed, so they cannot follow a renamed
+        or retired test: their anchors must not reach the CI test-list check."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_login.py").write_text(
+                "def test_retry_after_lockout():\n    pass\n", encoding="utf-8")
+            notes = root / "notes"
+            live = GOOD.replace(
+                "Covered by `tests/test_login.py`.\n\n"
+                "Proved: temporarily disabled the latch → the test above failed as expected, then reverted.",
+                "Covered by `tests/test_login.py::test_retry_after_lockout`.")
+            retired = ARCHIVED_GOOD.replace(
+                "Covered by `tests/test_login.py`.\n\n"
+                "Proved: temporarily disabled the latch → the test above failed as expected, then reverted.",
+                "Covered by `tests/test_login.py::test_retired_long_ago`.")
+            write_tree(notes, {
+                "implemented/bug-fix/2026-09-08-login-retry-race.md": live,
+                "archived/bug-fix/2026-09-01-login-retry-race.md": retired,
+            })
+
+            dumped = self.run_verifier(notes, root, "--dump-anchors")
+            self.assertEqual(dumped.returncode, 0, dumped.stdout + dumped.stderr)
+            self.assertIn("tests/test_login.py::test_retry_after_lockout", dumped.stdout)
+            self.assertNotIn("test_retired_long_ago", dumped.stdout)
 
 
 if __name__ == "__main__":

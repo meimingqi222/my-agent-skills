@@ -3,9 +3,11 @@
 
 Usage:
     python3 verify-notes.py [--notes-dir .agents/notes] [--repo-root .]
-                            [--no-strict] [--allow-missing] [--seal]
+                            [--no-strict] [--allow-missing] [--seal] [--reseal]
                             [--strict-anchors] [--no-name-heuristic]
                             [--no-bare-resolution] [--find REGEX]
+                            [--for-path PATH [...]] [--dump-anchors]
+                            [--audit-commits [N]]
                             [--baseline FILE [--update-baseline]]
                             [--changed-only [--base HEAD]]
                             [--check-install]
@@ -13,11 +15,40 @@ Usage:
 Exit non-zero on any error. With --no-strict, a missing regression-test
 path degrades to a warning; with --allow-missing, a missing notes directory
 does not fail. --seal verifies the tree, then records every archived note's
-SHA-256 in `archived/manifest.json`; once sealed, any later modification or
+SHA-256 in `archived/manifest.json` and is append-only: it adds missing entries
+but never rewrites a recorded hash, so a note modified after sealing stays red
+(fix forward with a new note). The digest is computed over LF-normalised content,
+so a checkout's line endings never look like a modification. --reseal is the
+explicit escape hatch for tooling migrations (for example a digest-algorithm
+change): it rewrites the entries whose digest no longer matches and prints each
+one, so the rewrite is visible in review. Once sealed, any later modification or
 deletion of an archived note fails verification.
 
 --find REGEX prints the notes matching REGEX and exits without verifying; use it
 instead of an index file to locate the note that owns a decision.
+
+--for-path PATH [...] prints the notes that cite each PATH -- a note cites a
+file when a backticked repo-relative path in its body equals the path or names
+a directory containing it -- and exits without verifying. This is the edit-time
+reverse lookup: run it on the files you are about to change so the notes
+guarding them surface before the edit, not after.
+
+--dump-anchors prints every `path::anchor` bound in any ## Verification
+section, one per line, and exits. Feed it to a repo-side check that intersects
+the anchors with the real test list (`cargo test -- --list`, `pytest
+--collect-only`, ...) so CI can catch a renamed test that survives as an
+orphan substring. Notes under `archived/` are skipped: they are sealed and
+frozen, so they cannot be edited to follow a renamed or retired test, and their
+history may legitimately name tests that were later removed.
+
+--audit-commits [N] is an advisory scan of the last N commits (default 100,
+0 = all history): it warns on commits whose subject looks like a fix and that
+touched real code but added neither a note under --notes-dir nor a
+test-looking file. It answers "how many recent fixes went unlocked" — the gap
+the format gate cannot see, since it only verifies notes that exist. The
+heuristic cannot distinguish a trivial fix from a non-trivial one, so findings
+are printed as a report and never fail the gate; run it periodically or in a
+non-blocking CI step.
 
 Binding checks. `## Verification` may bind a note to one exact test by writing
 `path::anchor`, e.g. `tests/test_login.py::test_retry_after_lockout`; the anchor
@@ -56,6 +87,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+
+def latest_civil_date():
+    """Date-only records may have been authored anywhere, including UTC+14."""
+    easternmost = datetime.timezone(datetime.timedelta(hours=14))
+    return datetime.datetime.now(easternmost).date()
+
 LIFECYCLES = ("proposed", "implemented", "rejected", "archived")
 CLASSES = ("bug-fix", "feature", "architecture", "process", "testing", "simplification")
 FILENAME_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-.+\.md$")
@@ -85,6 +122,21 @@ BANNED_IMPLEMENTED_HEADINGS = re.compile(
 # Backticked path-like token that contains a directory separator.
 TEST_RE = re.compile(r"`([^`\s]*[/\\][^`\s]*)`")
 PROVED_RE = re.compile(r"^Proved:\s*\S", re.M)
+
+# Tokens that are machine-absolute, never repo-relative: URI schemes,
+# Windows drives, UNC/verbatim paths, POSIX roots, %-vars, and registry
+# hives. A `HKLM\SOFTWARE\Foo` or `C:\App` cited in prose is context, not a
+# test target, and must never hit the existence check.
+MACHINE_PATH_RE = re.compile(
+    r"^(?:"
+    r"[A-Za-z][A-Za-z0-9+.-]*://"       # URI scheme (https://, file://)
+    r"|[A-Za-z]:[\\/]"                  # Windows drive (C:\, D:/)
+    r"|\\\\"                            # UNC / verbatim (\\server, \\?\)
+    r"|/"                               # POSIX absolute
+    r"|%[A-Za-z_][A-Za-z0-9_]*%[\\/]"   # %WINDIR%\..., %APPDATA%\...
+    r"|HKEY_[A-Z_]+[\\/]"               # registry hive, long form
+    r"|HK(?:LM|CU|CR|U|CC|PD)[\\/]"     # registry hive, short form
+    r")", re.I)
 
 # Optional header lines naming a successor note. Both are validated for
 # resolution, self-reference, and cycles; `Partly-superseded-by` additionally
@@ -360,7 +412,7 @@ def parse_header(lines, lifecycle, path):
             errors.append(f"{path}: L4 must be `Archived: YYYY-MM-DD`")
         else:
             archive_date = valid_date(*archived_match.groups())
-            today = datetime.date.today()
+            today = latest_civil_date()
             if not archive_date:
                 errors.append(f"{path}: archived date is not a valid calendar date")
             elif archive_date > today:
@@ -385,7 +437,15 @@ def parse_header(lines, lifecycle, path):
 
 
 def note_digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """归档 note 的内容摘要，**行尾归一化后**再哈希。
+
+    仓库以 LF 存 blob；Windows 检出（core.autocrlf）会把工作区写成 CRLF。
+    按原始字节密封会让同一份内容在不同平台得出不同摘要——密封清单在
+    Windows 上生成、在 Linux CI 复核时报「archived note was modified after
+    sealing」（实际只是检出换行差异）。密封的语义是内容未变，行尾不算。
+    """
+    data = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(data).hexdigest()
 
 
 def load_manifest(notes):
@@ -419,9 +479,23 @@ def check_verification(path, ver, repo_root, strict, opts, bare_index,
     if "<what you re-broke>" in ver:
         errors.append(f"{path}: `Proved:` line still carries the template placeholder")
 
-    raw = [t.strip() for t in TEST_RE.findall(ver)]
+    # `Proved:` lines cite evidence as well as tests: a backticked path on a
+    # `Proved:` line that does not exist (e.g. `target/foo.log` that `cargo
+    # clean` deletes) is evidence, so it must not fail a fresh clone — it gets
+    # a warning instead. A `Proved:` token that does exist still counts as a
+    # binding target like any other.
+    proved_tokens = set()
+    raw = []
+    for line in ver.splitlines():
+        found = [t.strip() for t in TEST_RE.findall(line)]
+        raw.extend(found)
+        if PROVED_RE.match(line):
+            proved_tokens.update(found)
+
     targets, anchors = [], []
     for token in raw:
+        if MACHINE_PATH_RE.match(token):
+            continue
         left, sep, right = token.partition(ANCHOR_SEP)
         if sep and right and (repo_root / left).is_file():
             targets.append(left)
@@ -435,7 +509,22 @@ def check_verification(path, ver, repo_root, strict, opts, bare_index,
         )
         return errors, warnings
 
-    missing = [t for t in targets if not (repo_root / t).exists()]
+    evidence_missing = sorted({
+        t.partition(ANCHOR_SEP)[0].strip()
+        for t in proved_tokens
+        if ":" not in t.partition(ANCHOR_SEP)[0]
+        and not MACHINE_PATH_RE.match(t)
+        and not (repo_root / t.partition(ANCHOR_SEP)[0]).exists()
+    })
+    if evidence_missing:
+        warnings.append(
+            f"WARNING: {path}: `Proved:` cites evidence not present in the "
+            f"repo: {', '.join(evidence_missing)}; commit the red-run output "
+            f"somewhere durable (e.g. a `<notes>-evidence/` sibling of the "
+            f"notes tree) or record the natural-red source inline")
+
+    missing = [t for t in targets
+               if not (repo_root / t).exists() and t not in proved_tokens]
     if missing:
         msg = f"{path}: verification target(s) not found: {', '.join(missing)}"
         if strict:
@@ -568,7 +657,7 @@ def check_file(path, lifecycle, cls, repo_root, strict, opts, bare_index,
     filename_match = FILENAME_RE.match(path.name)
     if filename_match:
         file_date = valid_date(*filename_match.groups())
-        today = datetime.date.today()
+        today = latest_civil_date()
         if not file_date:
             errors.append(f"{path}: filename date is not a valid calendar date")
         elif file_date > today:
@@ -661,6 +750,197 @@ def find_notes(notes, pattern):
     return 0
 
 
+def _norm_repo_path(token):
+    """Normalize a backticked repo-relative path token to lowercase posix
+    parts; None when the token is not a usable path (URL, absolute,
+    registry hive, `..`, or a `path::anchor` remainder)."""
+    token = token.partition(ANCHOR_SEP)[0].strip()
+    if not token or ":" in token or token.startswith(("/", "\\", "~")):
+        return None
+    if MACHINE_PATH_RE.match(token):
+        return None
+    parts = [p for p in re.split(r"[/\\]+", token) if p not in ("", ".")]
+    if not parts or any(p == ".." for p in parts):
+        return None
+    return tuple(p.lower() for p in parts)
+
+
+def covered_notes(notes, paths):
+    """Print the notes citing each PATH: a note cites a file when a backticked
+    repo-relative path anywhere in its body equals PATH or names a directory
+    containing it. Archived and rejected notes are labelled, since they are
+    context, not current locks."""
+    wanted = []
+    for raw in paths:
+        norm = _norm_repo_path(raw)
+        if norm is None:
+            print(f"{raw}: not a repo-relative path, skipped")
+        else:
+            wanted.append((raw, norm))
+    hits = 0
+    for top in sorted(p for p in notes.iterdir() if p.is_dir() and p.name in LIFECYCLES):
+        for second in sorted(p for p in top.iterdir() if p.is_dir() and p.name in CLASSES):
+            for md in sorted(second.glob("*.md")):
+                if md.name.endswith(".zh.md") or md.name in SKIP_NAMES:
+                    continue
+                text = read_text_safe(md)
+                cited = set()
+                for token in TEST_RE.findall(text):
+                    norm = _norm_repo_path(token)
+                    if norm:
+                        cited.add(norm)
+                matched = []
+                for raw, norm in wanted:
+                    for c in cited:
+                        if norm == c or norm[: len(c)] == c:
+                            matched.append(raw)
+                            break
+                if not matched:
+                    continue
+                hits += 1
+                lines = text.splitlines()
+                title = lines[0][len("# Agent Note: "):] if lines and lines[0].startswith("# Agent Note: ") else md.name
+                state = {"implemented": "locks", "archived": "history",
+                         "proposed": "proposed", "rejected": "rejected"}.get(top.name, top.name)
+                print(md.relative_to(notes).as_posix())
+                print(f"    title:  {title}")
+                print(f"    state:  {state}")
+                print(f"    covers: {', '.join(matched)}")
+                print()
+    print(f"{hits} note(s) cite {len(wanted)} queried path(s)")
+    return 0
+
+
+def dump_anchors(notes):
+    """Print every `path::anchor` bound in a ## Verification section.
+
+    Archived notes are skipped: they are sealed (see the manifest) and therefore
+    cannot be edited to follow a renamed or retired test — the seal, not the live
+    test list, is what keeps them honest. Their anchors may legitimately name
+    tests that were later removed.
+    """
+    count = 0
+    for top in sorted(p for p in notes.iterdir() if p.is_dir() and p.name in LIFECYCLES):
+        if top.name == "archived":
+            continue
+        for second in sorted(p for p in top.iterdir() if p.is_dir() and p.name in CLASSES):
+            for md in sorted(second.glob("*.md")):
+                text = "\n".join(strip_fences(read_text_safe(md)))
+                if "## Verification" not in text:
+                    continue
+                ver = text.split("## Verification", 1)[1]
+                for token in TEST_RE.findall(ver):
+                    left, sep, right = token.strip().partition(ANCHOR_SEP)
+                    if sep and right:
+                        count += 1
+                        print(f"{left.strip()}::{right.strip()}")
+    print(f"{count} anchor(s)", file=sys.stderr)
+    return 0
+
+
+FIXISH_RE = re.compile(
+    r"\b(?:fix(?:e[sd])?|bug(?:fix)?|regress\w*|revert|hotfix|patch)\b", re.I)
+TESTY_RE = re.compile(
+    r"(^|/)(tests?|__tests__|spec)(/|$)|(_test|\.test|\.spec)\.[a-z0-9]+$|"
+    r"(^|/)test_[^/]*\.[a-z0-9]+$", re.I)
+DOCPATH_RE = re.compile(r"(^|/)docs?/|\.(md|markdown|rst|txt|adoc)$", re.I)
+
+
+def _audit_paths(repo, sha):
+    """Files touched by a commit (paths repo-relative, posix)."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo), "diff-tree", "--no-commit-id",
+             "--name-only", "-r", "--root", sha],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    if r.returncode != 0:
+        return []
+    return [l.strip() for l in r.stdout.splitlines() if l.strip()]
+
+
+def audit_commits(notes, repo, limit):
+    """Heuristic 'should have had a note' scan over recent history.
+
+    Flags commits whose subject looks like a fix AND which touched real code
+    but added neither a note nor a test-looking file. Advisory only — the
+    heuristic cannot tell a trivial fix from a non-trivial one, so output is a
+    report, never a gate failure. Returns 0 always.
+    """
+    try:
+        notes_rel = notes.resolve().relative_to(repo.resolve()).as_posix()
+    except (OSError, ValueError):
+        print(f"notes dir {notes} is not inside repo root {repo}; "
+              f"cannot audit commits against it")
+        return 0
+    notes_prefix = notes_rel.rstrip("/") + "/"
+    try:
+        inside = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, encoding="utf-8", errors="replace",
+            timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        inside = None
+    if inside is None or inside.returncode != 0:
+        print(f"{repo} is not a git work tree; --audit-commits needs history")
+        return 0
+
+    log_args = ["git", "-C", str(repo), "log", "--no-merges",
+                "--format=%H%x09%s"]
+    if limit and limit > 0:
+        log_args += ["-n", str(limit)]
+    try:
+        r = subprocess.run(log_args, capture_output=True, encoding="utf-8",
+                           errors="replace", timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        print("git log failed", file=sys.stderr)
+        return 1
+    if r.returncode != 0:
+        print(f"git log failed: {r.stderr.strip()}", file=sys.stderr)
+        return 1
+
+    flagged, fixish, skipped = [], 0, 0
+    for line in r.stdout.splitlines():
+        if "\x09" not in line:
+            continue
+        sha, subject = line.split("\x09", 1)
+        if not FIXISH_RE.search(subject):
+            continue
+        fixish += 1
+        paths = _audit_paths(repo, sha)
+        touched_note = any(p.startswith(notes_prefix) and p.endswith(".md")
+                           for p in paths)
+        if touched_note:
+            continue
+        code = [p for p in paths
+                if not TESTY_RE.search(p) and not DOCPATH_RE.search(p)
+                and not p.startswith(notes_prefix)]
+        tests = [p for p in paths if TESTY_RE.search(p)]
+        if not code:
+            # docs-only or test-only "fix" commits carry no behavior change.
+            skipped += 1
+            continue
+        short = sha[:10]
+        if tests:
+            flagged.append(
+                f"{short} {subject} -- touched code + test file(s) "
+                f"({tests[0]}) but no note")
+        else:
+            flagged.append(
+                f"{short} {subject} -- touched code but no note and no "
+                f"test file ({code[0]}{'...' if len(code) > 1 else ''})")
+
+    for f in flagged:
+        print(f"WARNING: {f}")
+    print(f"{fixish} fix-looking commit(s) scanned "
+          f"({'all history' if not limit or limit <= 0 else f'last {limit}'}), "
+          f"{fixish - len(flagged) - skipped} carried a note, "
+          f"{skipped} touched no code, {len(flagged)} look unnoted")
+    return 0
+
+
 def check_install(notes, repo):
     """Read-only wiring self-check: the tree exists and some runner invokes it.
 
@@ -677,13 +957,27 @@ def check_install(notes, repo):
               f"README.md so the gate has a tree on a fresh clone")
         wired = False
 
-    hook = repo / ".git" / "hooks" / "pre-commit"
-    try:
-        hook_ok = hook.is_file() and "verify-notes" in hook.read_text(
-            encoding="utf-8-sig", errors="ignore")
-    except OSError:
-        hook_ok = False
-    print(f"pre-commit hook: {'OK' if hook_ok else 'MISSING'} ({hook.as_posix()})")
+    hook_ok = False
+    # Check the default location plus `.githooks/`, the conventional tracked
+    # hooks dir for repos that wire `core.hooksPath`. A hook counts as a gate
+    # only when some line invokes the verifier without a query-mode flag —
+    # a hook that merely prints `--for-path` reminders is a reminder, not a
+    # gate, and must not satisfy the install check.
+    QUERY_FLAGS = ("--for-path", "--find", "--dump-anchors",
+                   "--check-install", "--audit-commits")
+    for hook in (repo / ".git" / "hooks" / "pre-commit",
+                 repo / ".githooks" / "pre-commit"):
+        try:
+            lines = hook.read_text(
+                encoding="utf-8-sig", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if ("verify-notes" in line and "--notes-dir" in line
+                    and not any(f in line for f in QUERY_FLAGS)):
+                hook_ok = True
+    print(f"pre-commit hook: {'OK' if hook_ok else 'MISSING'} "
+          f"(.git/hooks or .githooks; query-only invocations do not count)")
 
     ci_hits = []
     workflows = repo / ".github" / "workflows"
@@ -704,6 +998,33 @@ def check_install(notes, repo):
             continue
     print(f"CI config: {', '.join(ci_hits) if ci_hits else 'NOT FOUND'} "
           f"(a packaging-script wiring cannot be auto-detected)")
+
+    # Agent-facing docs: the gate can be perfectly wired and still useless when
+    # no standing doc tells agents the tree exists. Advisory only — a missing
+    # pointer is a discoverability gap, not a broken gate.
+    try:
+        doc_rel = notes.resolve().relative_to(repo.resolve()).as_posix()
+    except (OSError, ValueError):
+        doc_rel = notes.as_posix()
+    doc_hit = None
+    for candidate in ("AGENTS.md", "CLAUDE.md", "README.md",
+                      "docs/GOAL.md", "docs/HANDOFF.md"):
+        p = repo / candidate
+        try:
+            text = p.read_text(encoding="utf-8-sig", errors="ignore")
+        except OSError:
+            continue
+        if doc_rel in text or "verify-notes" in text or ".agents/notes" in text:
+            doc_hit = candidate
+            break
+    if doc_hit:
+        print(f"agent doc pointer: OK ({doc_hit} mentions {doc_rel})")
+    else:
+        print(f"agent doc pointer: MISSING — no AGENTS.md/CLAUDE.md/README.md "
+              f"(or docs/GOAL.md, docs/HANDOFF.md) mentions `{doc_rel}`; agents "
+              f"will never know the notes exist. Add the standing rule plus the "
+              f"`--for-path` reverse lookup (see SKILL.md 'Installing into a "
+              f"repository'); pointers only, never copied decision content")
 
     if wired and (hook_ok or ci_hits):
         print(f"INSTALLED: {notes} is verified by "
@@ -731,6 +1052,14 @@ def main(argv=None):
         help="record the SHA-256 of every archived note in archived/manifest.json",
     )
     ap.add_argument(
+        "--reseal",
+        action="store_true",
+        help=(
+            "rewrite digests that no longer match, printing each one; for tooling "
+            "migrations (e.g. a digest-algorithm change), never for editing history"
+        ),
+    )
+    ap.add_argument(
         "--strict-anchors",
         action="store_true",
         help="make a `path::anchor` whose anchor is missing from that file an error",
@@ -749,6 +1078,30 @@ def main(argv=None):
         "--find",
         metavar="REGEX",
         help="print notes matching REGEX (title, body, or filename) and exit",
+    )
+    ap.add_argument(
+        "--for-path",
+        metavar="PATH",
+        nargs="+",
+        help="print the notes citing PATH (a file under the cited path, or "
+             "the cited path itself) and exit without verifying",
+    )
+    ap.add_argument(
+        "--dump-anchors",
+        action="store_true",
+        help="print every `path::anchor` bound in ## Verification, one per "
+             "line, for a repo-side check against the real test list, and exit",
+    )
+    ap.add_argument(
+        "--audit-commits",
+        metavar="N",
+        type=int,
+        nargs="?",
+        const=100,
+        default=None,
+        help="advisory scan of the last N commits (default 100, 0 = all): "
+             "warn on fix-looking commits that touched code but added "
+             "neither a note nor a test file, then exit",
     )
     ap.add_argument(
         "--baseline",
@@ -811,6 +1164,15 @@ def main(argv=None):
 
     if args.find:
         return find_notes(notes, args.find)
+
+    if args.for_path:
+        return covered_notes(notes, args.for_path)
+
+    if args.dump_anchors:
+        return dump_anchors(notes)
+
+    if args.audit_commits is not None:
+        return audit_commits(notes, repo, args.audit_commits)
 
     if (notes / "INDEX.md").exists():
         errors.append(f"{notes}/INDEX.md: no centralized index, the tree is the index")
@@ -902,14 +1264,25 @@ def main(argv=None):
     if manifest is None:
         errors.append(f"{notes}/archived/{MANIFEST_NAME}: manifest must be a JSON object")
     else:
-        if args.seal and not errors:
-            new = [(md, rel) for md, rel in archived if rel not in manifest]
-            for md, rel in new:
-                manifest[rel] = note_digest(md)
-            if new:
+        if (args.seal or args.reseal) and not errors:
+            # `--seal` 是 append-only：只补缺失条目，绝不改写已记录的哈希——
+            # 密封后被改过的 note 就该一直红着，修正靠新 note，不靠改历史。
+            # `--reseal` 是**工具迁移**的显式出口（例如摘要算法从原始字节改为
+            # 行尾归一化）：它改写不一致的摘要并逐条打印路径，改动在评审里可见。
+            sealed = []
+            for md, rel in archived:
+                digest = note_digest(md)
+                if rel not in manifest:
+                    manifest[rel] = digest
+                    sealed.append(("sealed", rel))
+                elif args.reseal and manifest[rel] != digest:
+                    manifest[rel] = digest
+                    sealed.append(("resealed", rel))
+            if sealed:
                 (notes / "archived" / MANIFEST_NAME).write_text(
                     json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-                print(f"sealed {len(new)} archived note(s)")
+                for action, rel in sealed:
+                    print(f"{action} {rel}")
         live = {rel for _, rel in archived}
         for rel in sorted(set(manifest) - live):
             errors.append(f"{notes}/{rel}: sealed archived note is missing")
