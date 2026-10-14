@@ -167,6 +167,15 @@ from readers.pi import (
     _pi_session_id_from_path,
     read_pi_session,
 )
+from readers.workbuddy import (
+    WORKBUDDY_ID_RE,
+    _discover_workbuddy,
+    _find_workbuddy_id,
+    _workbuddy_data_dirs,
+    _workbuddy_quick_meta,
+    _workbuddy_source,
+    read_workbuddy_session,
+)
 from readers.qoder import (
     _discover_qoder,
     _find_qoder_id,
@@ -319,6 +328,13 @@ __all__ = [
     "read_opencode2_session",
     "read_opencode_session",
     "read_pi_session",
+    "WORKBUDDY_ID_RE",
+    "_discover_workbuddy",
+    "_find_workbuddy_id",
+    "_workbuddy_data_dirs",
+    "_workbuddy_quick_meta",
+    "_workbuddy_source",
+    "read_workbuddy_session",
     "read_qoder_session",
     "read_zcode_session",
 ]

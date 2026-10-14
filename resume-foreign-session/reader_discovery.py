@@ -73,6 +73,13 @@ from readers import (
     read_opencode2_session,
     read_opencode_session,
     read_pi_session,
+    read_workbuddy_session,
+    WORKBUDDY_ID_RE,
+    _discover_workbuddy,
+    _find_workbuddy_id,
+    _workbuddy_data_dirs,
+    _workbuddy_quick_meta,
+    _workbuddy_source,
     read_qoder_session,
     read_zcode_session,
 )
@@ -124,6 +131,7 @@ CURRENT_SESSION_ENV = (
     "ZCODE_SESSION_ID",
     "PI_SESSION_ID",
     "DSH_SESSION_ID",
+    "CODEBUDDY_SESSION_ID",
 )
 
 
@@ -202,6 +210,8 @@ def discover_sessions(
         sessions = _discover_pi(requested_cwd, within_min)
     elif tool == "dsh":
         sessions = _discover_dsh(requested_cwd, within_min)
+    elif tool == "workbuddy":
+        sessions = _discover_workbuddy(requested_cwd, within_min)
     else:
         sessions = _discover_cursor_cli(requested_cwd, within_min)
         sessions.extend(_discover_cursor_desktop(requested_cwd, within_min))
@@ -362,6 +372,21 @@ def _candidate_from_path(tool: str, raw_path: str, cwd: str) -> dict[str, Any] |
                 "updated_at_ms": updated,
             }
         return None
+    if tool == "workbuddy" and path.is_file() and path.suffix == ".jsonl":
+        if any(_under(path, root / "projects") for root in _workbuddy_data_dirs()):
+            meta = _workbuddy_quick_meta(path)
+            if meta is None:
+                return None
+            return {
+                "tool": tool,
+                "source": _workbuddy_source(path),
+                "session_id": meta["session_id"],
+                "path": str(path),
+                "title": meta.get("title"),
+                "cwd": meta.get("cwd") or cwd,
+                "updated_at_ms": updated,
+            }
+        return None
     if tool == "dsh" and path.is_file() and path.name == "session.jsonl.zstd":
         if _under(path, _dsh_data_dir()):
             meta = _dsh_quick_meta(path)
@@ -396,6 +421,7 @@ def _finders() -> dict[str, Any]:
         "maka": _find_maka_id,
         "pi": lambda sid, cwd: _find_pi_id(sid, cwd, _candidate_from_path),
         "dsh": lambda sid, cwd: _find_dsh_id(sid, cwd, _candidate_from_path),
+        "workbuddy": _find_workbuddy_id,
     }
 
 
@@ -441,6 +467,7 @@ def resolve_session(
         UUID_RE.fullmatch(ref)
         or UUID_RE.fullmatch(uuid_ref)
         or ref.startswith(("ses_", "sess_"))
+        or WORKBUDDY_ID_RE.fullmatch(ref)
     ):
         finders = _finders()
         for name in TOOLS if tool == ANY_TOOL else (tool,):
@@ -498,4 +525,6 @@ def read_resolved_session(
         return read_pi_session(candidate["path"], max_tool_chars)
     if tool == "dsh":
         return read_dsh_session(candidate["path"], max_tool_chars)
+    if tool == "workbuddy":
+        return read_workbuddy_session(candidate["path"], max_tool_chars)
     return read_cursor_session(candidate, max_tool_chars)

@@ -3,8 +3,8 @@ name: resume-foreign-session
 description: >
   Resume or continue work from a recent session created by another coding agent:
   Claude Code, Codex, Cursor, AmpCode, Devin, OpenCode, OpenCode v2, Qoder,
-  Command Code, Grok (Grok Build), zcode, Maka, pi (pi-coding-agent), or DSH
-  (DeepSeek Harness). Use when the user switched tools and wants to pick up
+  Command Code, Grok (Grok Build), zcode, Maka, pi (pi-coding-agent), DSH
+  (DeepSeek Harness), or WorkBuddy. Use when the user switched tools and wants to pick up
   where a previous session left off, or names a session from one of those
   tools by description, path, or native ID.
 license: Apache-2.0
@@ -13,8 +13,8 @@ metadata:
   derived-from: >
     Grok CLI bundled skill `shared/resume-session` (Apache-2.0); extended with
     AmpCode, Devin, OpenCode, OpenCode v2, Qoder, Command Code, Grok, zcode,
-    Maka, pi, and DSH support and a handoff digest.
-  tools: claude-code, codex, cursor, ampcode, devin, opencode, opencode2, qoder, command-code, grok, zcode, maka, pi, dsh
+    Maka, pi, DSH, and WorkBuddy support and a handoff digest.
+  tools: claude-code, codex, cursor, ampcode, devin, opencode, opencode2, qoder, command-code, grok, zcode, maka, pi, dsh, workbuddy
   # Claude Code v2.1.129+ expands ${CLAUDE_SKILL_DIR} here so the reader runs
   # without a permission prompt; other harnesses ignore this field.
 allowed-tools: Bash(${CLAUDE_SKILL_DIR}/session_reader.py *)
@@ -29,9 +29,11 @@ This skill reads sessions created by **Claude Code** (`claude`), **Codex**
 **Command Code** (`commandcode`, also accepted as `command-code`), **Grok**
 (`grok`, whose CLI calls itself Grok Build, also accepted as `grok-build`),
 **zcode** (`zcode`), **Maka** (`maka`), **pi** (`pi`, the pi-coding-agent,
-also accepted as `pi-coding-agent` or `pi-agent`), or **DSH** (`dsh`,
+also accepted as `pi-coding-agent` or `pi-agent`), **DSH** (`dsh`,
 DeepSeek Harness, also accepted as `deepseek`, `deepseek-harness`, or
-`deepseek-cli`) and produces a safe handoff so you can continue the user's
+`deepseek-cli`), or **WorkBuddy** (`workbuddy`, Tencent's CodeBuddy-based
+desktop agent, both the `~/.workbuddy` and `~/.workbuddy-ai` builds; also
+accepted as `work-buddy`) and produces a safe handoff so you can continue the user's
 work in this session.
 
 ## Start here
@@ -43,7 +45,7 @@ command answers it (resolve `$READER` first - see **Locate the reader** below):
 python3 "$READER" any show latest --cwd <cwd>
 ```
 
-`any` sweeps all fourteen tools and picks the globally newest session. The default
+`any` sweeps all fifteen tools and picks the globally newest session. The default
 output is a **handoff digest**, typically under 10 KB rather than the whole
 transcript:
 
@@ -112,7 +114,7 @@ python3 "$READER" <tool> show [ref] [--cwd <cwd>] [--full] [--tail N] [--json]
 
 `<tool>` is `any`, or one of `claude`, `codex`, `cursor`, `amp`, `devin`,
 `opencode`, `opencode2`, `qoder`, `commandcode`, `grok`, `zcode`, `maka`,
-`pi`, `dsh`.
+`pi`, `dsh`, `workbuddy`.
 Prefer `any` unless the user named a tool.
 
 Arguments for `show`:
@@ -122,20 +124,10 @@ Arguments for `show`:
   If the current directory has no sessions, the reader falls back to the most
   recent session across all working directories **and emits a `cwd_fallback`
   warning** - when you see it, confirm the project is the one the user meant
-  before acting. Devin CLI transcripts whose project root cannot be inferred
-  are excluded from per-directory listings but remain reachable by native
-  session ID. Qoder transcripts written by pre-1.1 builds, and its IDE-side
-  stores, use schemas this reader does not render; they are skipped rather
-  than shown as empty sessions. Command Code transcripts that predate its
-  `version: 3` schema record no working directory, so they are listed only
-  under their own project directory or with `--any-cwd`. Grok and zcode each
-  write a separate transcript per subagent they spawn; those hold the parent
-  session's own tool traffic rather than work the user drove, so they are kept
-  out of listings and stay reachable by native session ID (Grok adds a
-  `subagent_session` warning when you open one that way). OpenCode v2
-  (`opencode2`) sessions with a non-null `parent_id` are likewise subagent
-  transcripts and are kept out of listings; they remain reachable by native
-  session ID with a `subagent_session` warning.
+  before acting. Some tools keep certain sessions out of listings (subagent
+  transcripts, sessions with no recorded working directory, unsupported legacy
+  schemas); most stay reachable by native session ID. Per-tool details are in
+  [references/tool-quirks.md](references/tool-quirks.md).
 - **A native session ID or transcript/store path** — accepted directly. For
   Grok that path is the session directory under `~/.grok/sessions/` or the
   `chat_history.jsonl` inside it.

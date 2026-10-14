@@ -10,7 +10,6 @@ import re
 import sqlite3
 import sys
 import time
-import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -30,6 +29,7 @@ TOOLS = (
     "maka",
     "pi",
     "dsh",
+    "workbuddy",
 )
 ANY_TOOL = "any"
 SELECTABLE = TOOLS + (ANY_TOOL,)
@@ -48,6 +48,8 @@ TOOL_ALIASES = {
     "deepseek": "dsh",
     "deepseek-harness": "dsh",
     "deepseek-cli": "dsh",
+    "work-buddy": "workbuddy",
+    "workbuddy-ai": "workbuddy",
 }
 
 UUID_RE = re.compile(
@@ -156,19 +158,19 @@ def _add_warning(warnings: list[dict[str, str]], code: str, message: str) -> Non
         warnings.append(_warning(code, message))
 
 
+# Control characters (General_Category Cc: U+0000-001F, U+007F-009F) and lone
+# surrogates (Cs: U+D800-DFFF), except tab and newline. Both categories are
+# closed sets under Unicode's stability policy, so this class equals the old
+# per-character `unicodedata.category` test exactly -- and runs in C instead of
+# a Python loop over every character of every transcript.
+_UNSAFE_CHARS_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\ud800-\udfff]")
+
+
 def _safe_text(value: Any) -> str:
     if value is None:
         return ""
     text = value if isinstance(value, str) else str(value)
-    output: list[str] = []
-    for char in text:
-        if char in ("\n", "\t"):
-            output.append(char)
-        elif unicodedata.category(char) in {"Cc", "Cs"}:
-            output.append("\ufffd")
-        else:
-            output.append(char)
-    return "".join(output)
+    return _UNSAFE_CHARS_RE.sub("\ufffd", text)
 
 
 def _one_line(value: Any, limit: int) -> str:
@@ -326,6 +328,8 @@ AGENT_INTERNAL_PARTS = {
     ".grok",
     ".maka",
     ".opencode",
+    ".workbuddy",
+    ".workbuddy-ai",
     ".zcode",
     ".venv",
     "__pycache__",

@@ -28,6 +28,7 @@ from readers.opencode import read_opencode_session, read_opencode2_session, read
 from readers.pi import read_pi_session
 from readers.dsh import read_dsh_session
 from readers.qoder import read_qoder_session
+from readers.workbuddy import read_workbuddy_session
 
 
 class TestSessionReaderSuite(unittest.TestCase):
@@ -680,3 +681,155 @@ class TestSessionReaderSuite(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SafeTextTests(unittest.TestCase):
+    def test_matches_unicode_categories_over_every_code_point(self):
+        # The regex must replace exactly General_Category Cc/Cs, minus tab and
+        # newline -- the definition the per-character loop it replaced used.
+        import unicodedata
+
+        expected = []
+        for cp in range(0x110000):
+            ch = chr(cp)
+            unsafe = ch not in ("\n", "\t") and unicodedata.category(ch) in {"Cc", "Cs"}
+            expected.append("�" if unsafe else ch)
+        text = "".join(chr(cp) for cp in range(0x110000))
+        self.assertEqual(rc._safe_text(text), "".join(expected))
+
+    def test_terminal_escapes_are_neutralised(self):
+        self.assertEqual(rc._safe_text("a\tb\nc\x1b[31m\r"), "a\tb\nc�[31m�")
+        self.assertEqual(rc._safe_text(None), "")
+        self.assertEqual(rc._safe_text(12), "12")
+
+
+class WorkBuddyTests(unittest.TestCase):
+    """WorkBuddy (CodeBuddy-based) transcripts under ~/.workbuddy/projects."""
+
+    MAIN_ID = "11111111-2222-4333-8444-555555555555"
+
+    def setUp(self):
+        from unittest import mock
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / ".workbuddy"
+        self.project = self.root / "projects" / "Users-me-proj"
+        self.project.mkdir(parents=True)
+        self.cwd = "/Users/me/proj"
+        patcher = mock.patch.dict(os.environ, {"WORKBUDDY_CONFIG_DIR": str(self.root)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def write(self, name, records):
+        path = self.project / name
+        path.write_text("".join(json.dumps(r, ensure_ascii=False, separators=(",", ":")) + "\n"
+                                for r in records), encoding="utf-8")
+        return path
+
+    def user(self, text, **provider):
+        return {"type": "message", "role": "user", "cwd": self.cwd, "sessionId": self.MAIN_ID,
+                "timestamp": 1791625966510, "providerData": provider,
+                "content": [{"type": "input_text", "text": text}]}
+
+    def main_session(self):
+        reminder = ('<system-reminder data-role="user-context">\n<user_info>\nOS Version: darwin\n'
+                    '</user_info>\n</system-reminder>\n')
+        return self.write(f"{self.MAIN_ID}.jsonl", [
+            {"type": "session-meta", "sessionId": self.MAIN_ID, "timestamp": 1791625967469, "meta": {}},
+            self.user(reminder + "<user_query>\nfix the login retry\n</user_query>", agent="cli"),
+            {"type": "reasoning", "content": [], "rawContent": [{"type": "reasoning_text", "text": "secret"}]},
+            {"type": "function_call", "name": "Write", "callId": "c1", "cwd": self.cwd,
+             "arguments": json.dumps({"file_path": "/Users/me/proj/src/login.py", "content": "x"})},
+            {"type": "function_call", "name": "Write", "callId": "c2", "cwd": self.cwd,
+             "arguments": json.dumps({"file_path": "/Users/me/proj/.workbuddy/memory/today.md", "content": "x"})},
+            {"type": "function_call_result", "callId": "c1", "status": "completed",
+             "output": {"type": "text", "text": "ok"}},
+            {"type": "function_call_result", "callId": "c2", "status": "incomplete",
+             "output": {"type": "text", "text": "\u001b[31mUnknown command\u001b[0m"}},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Fixed it."}],
+             "providerData": {"model": "hy3"}},
+            self.user("/compact", agent="compact", isCompactInternal=True),
+            self.user("<cb_summary>\nSummary of the conversation so far: login work.\n</cb_summary>",
+                      agent="cli", isCompactInternal=True, isCompacted=True),
+            self.user('<teammate-message teammate_id="analyst">report</teammate-message>', agent="cli"),
+            {"type": "message", "role": "user", "content": [
+                {"type": "image_blob_ref", "blob_id": "b1"}, {"type": "input_text", "text": "and this screenshot"}]},
+            {"type": "ai-title", "aiTitle": "AI title", "sessionId": self.MAIN_ID},
+            {"type": "custom-title", "customTitle": "Login retry fix", "sessionId": self.MAIN_ID},
+        ])
+
+    def test_reader_separates_requests_from_harness_text(self):
+        res = read_workbuddy_session(self.main_session())
+        self.assertEqual(res["tool"], "workbuddy")
+        self.assertEqual(res["source"], "workbuddy")
+        self.assertEqual(res["session_id"], self.MAIN_ID)
+        self.assertEqual(res["title"], "Login retry fix")
+        self.assertEqual(res["model"], "hy3")
+        requests = [t["text"] for t in res["turns"] if t["role"] == "user"]
+        self.assertEqual(requests, ["fix the login retry", "and this screenshot"])
+        self.assertIn("login work", res["prior_context"]["text"])
+        codes = {w["code"] for w in res["warnings"]}
+        self.assertTrue({"history_compacted", "harness_text_dropped", "unsafe_records_skipped",
+                         "attachments_skipped"} <= codes)
+        self.assertNotIn("subagent_session", codes)
+        results = res["turns"][1]["tool_results"]
+        self.assertEqual([r["is_error"] for r in results], [False, True])
+        self.assertNotIn("\u001b", results[1]["content"])
+        touched = [f["path"] for f in res["files_touched"]]
+        self.assertIn("src/login.py", touched)
+        self.assertFalse(any(".workbuddy" in p for p in touched))
+        self.assertNotIn("secret", sr.render_digest(res))
+
+    def test_listing_skips_teammates_and_uses_sidecar_cwd(self):
+        from reader_discovery import discover_sessions, resolve_session
+
+        self.main_session()
+        self.write("agent-abc12345.jsonl", [
+            self.user('<teammate-message teammate_id="team-lead">analyse</teammate-message>', agent="analyst"),
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "done"}]},
+        ])
+        migrated = "0123456789abcdef0123456789abcdef"
+        self.write(f"{migrated}.jsonl", [
+            {"type": "message", "role": "user", "content": "clean the 8085 port"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+        ])
+        (self.project / f"{migrated}.meta.json").write_text(json.dumps({"cwd": self.cwd}))
+
+        listed = {s["session_id"]: s for s in discover_sessions("workbuddy", self.cwd, 0)}
+        self.assertEqual(set(listed), {self.MAIN_ID, migrated})
+        self.assertEqual(listed[migrated]["title"], "clean the 8085 port")
+        self.assertEqual(listed[self.MAIN_ID]["title"], "Login retry fix")
+
+        for native in (migrated, "agent-abc12345"):
+            found = resolve_session("workbuddy", native, "/elsewhere")
+            self.assertEqual(Path(found["path"]).stem, native)
+        teammate = read_workbuddy_session(self.project / "agent-abc12345.jsonl")
+        self.assertIn("subagent_session", {w["code"] for w in teammate["warnings"]})
+        self.assertEqual([t["role"] for t in teammate["turns"]], ["assistant"])
+
+    def test_aliases(self):
+        self.assertEqual(sr.TOOL_ALIASES.get("work-buddy"), "workbuddy")
+        self.assertIn("workbuddy", sr.TOOLS)
+
+    def test_running_inside_workbuddy_skips_its_own_session(self):
+        from unittest import mock
+        from reader_discovery import current_session_ids, resolve_session
+
+        older = "99999999-8888-4777-8666-555555555555"
+        path = self.write(f"{older}.jsonl", [
+            {"type": "message", "role": "user", "cwd": self.cwd, "sessionId": older,
+             "content": "earlier work"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+        ])
+        os.utime(path, (1_700_000_000, 1_700_000_000))
+        self.main_session()  # newest: the session this agent is running in
+        with mock.patch.dict(os.environ, {"CODEBUDDY_SESSION_ID": self.MAIN_ID.upper(),
+                                          "CLAUDE_SESSION_ID": ""}):
+            exclude = current_session_ids()
+            self.assertIn(self.MAIN_ID, exclude)
+            latest = resolve_session("workbuddy", "latest", self.cwd, exclude=exclude)
+            self.assertEqual(latest["session_id"], older)
+            # Naming the running session explicitly is still honoured.
+            named = resolve_session("workbuddy", self.MAIN_ID, self.cwd, exclude=exclude)
+            self.assertEqual(named["session_id"], self.MAIN_ID)
