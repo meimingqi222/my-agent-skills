@@ -1,11 +1,11 @@
 ---
 name: windows-window-ops
-description: Find, enumerate, inspect, wait for, foreground, move, close, screenshot, or send keys to native Win32 desktop windows from PowerShell. Use for Wails, Electron, WinForms, and other desktop apps when Codex needs to confirm launch/state, handle secondary or hidden windows, capture covered/minimized/off-screen windows, visually verify UI, or drive a native app without Playwright/WebDriver. Do not use for normal browser tabs.
+description: Find, enumerate, inspect, wait for, foreground, move, close, screenshot, or send keys to native Win32 desktop windows from PowerShell. Use for Wails, Electron, WinForms, and other desktop apps when the agent needs to confirm launch/state, handle secondary or hidden windows, capture covered/minimized/off-screen windows, visually verify UI, or drive a native app without Playwright/WebDriver. Do not use for normal browser tabs.
 ---
 
 # Windows window operations
 
-Version 0.6.1
+Version 0.6.2
 
 A tested PowerShell module (`scripts/WindowOps.ps1`) wrapping the Win32 APIs for finding
 and controlling native windows — desktop apps (Wails/Electron/etc.), not browser tabs.
