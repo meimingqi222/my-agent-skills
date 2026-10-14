@@ -31,7 +31,10 @@ instead of an index file to locate the note that owns a decision.
 file when a backticked repo-relative path in its body equals the path or names
 a directory containing it -- and exits without verifying. This is the edit-time
 reverse lookup: run it on the files you are about to change so the notes
-guarding them surface before the edit, not after.
+guarding them surface before the edit, not after. Output is one entry per note
+(title plus the first line of its decision), newest first, capped by --limit
+(default 10); archived notes are counted but listed only with
+--include-archived.
 
 --dump-anchors prints every `path::anchor` bound in any ## Verification
 section, one per line, and exits. Feed it to a repo-side check that intersects
@@ -448,6 +451,13 @@ def note_digest(path):
     return hashlib.sha256(data).hexdigest()
 
 
+def is_retired(entry):
+    """A manifest entry recording a deliberately retired (deleted) archived note:
+    `{"retired": "YYYY-MM-DD", "reason": "...", "sha256": "<last digest>"}`.
+    Plain string entries are live seals."""
+    return isinstance(entry, dict) and "retired" in entry
+
+
 def load_manifest(notes):
     """The archived-freeze manifest, or None when the file is not a JSON object."""
     path = notes / "archived" / MANIFEST_NAME
@@ -765,49 +775,87 @@ def _norm_repo_path(token):
     return tuple(p.lower() for p in parts)
 
 
-def covered_notes(notes, paths):
-    """Print the notes citing each PATH: a note cites a file when a backticked
-    repo-relative path anywhere in its body equals PATH or names a directory
-    containing it. Archived and rejected notes are labelled, since they are
-    context, not current locks."""
-    wanted = []
-    for raw in paths:
-        norm = _norm_repo_path(raw)
-        if norm is None:
-            print(f"{raw}: not a repo-relative path, skipped")
-        else:
-            wanted.append((raw, norm))
-    hits = 0
+def _note_summary(text, fallback):
+    """(title, first line of the decision) for compact listings."""
+    lines = text.splitlines()
+    title = lines[0][len("# Agent Note: "):] if lines and lines[0].startswith("# Agent Note: ") else fallback
+    decision = ""
+    for heading in ("## Decision", "## Proposal"):
+        if heading in text:
+            for ln in text.split(heading, 1)[1].splitlines():
+                ln = ln.strip()
+                if ln.startswith("## "):
+                    break
+                if ln:
+                    decision = ln
+                    break
+            break
+    if len(decision) > 110:
+        decision = decision[:107].rstrip() + "..."
+    return title, decision
+
+
+def notes_citing(notes, paths, include_archived=True):
+    """Notes whose body cites any of PATHS (a backticked repo-relative path equal
+    to a queried path or naming a directory containing it), newest first.
+
+    Returns dicts with rel, lifecycle, title, decision, and matched paths.
+    Shared by `--for-path` and the duplicate check in new-note.py.
+    """
+    wanted = [(raw, norm) for raw in paths
+              for norm in [_norm_repo_path(raw)] if norm is not None]
+    hits = []
+    if not wanted or not notes.is_dir():
+        return hits
     for top in sorted(p for p in notes.iterdir() if p.is_dir() and p.name in LIFECYCLES):
+        if top.name == "archived" and not include_archived:
+            continue
         for second in sorted(p for p in top.iterdir() if p.is_dir() and p.name in CLASSES):
             for md in sorted(second.glob("*.md")):
                 if md.name.endswith(".zh.md") or md.name in SKIP_NAMES:
                     continue
                 text = read_text_safe(md)
-                cited = set()
-                for token in TEST_RE.findall(text):
-                    norm = _norm_repo_path(token)
-                    if norm:
-                        cited.add(norm)
-                matched = []
-                for raw, norm in wanted:
-                    for c in cited:
-                        if norm == c or norm[: len(c)] == c:
-                            matched.append(raw)
-                            break
+                cited = {norm for token in TEST_RE.findall(text)
+                         for norm in [_norm_repo_path(token)] if norm}
+                matched = [raw for raw, norm in wanted
+                           if any(norm == c or norm[: len(c)] == c for c in cited)]
                 if not matched:
                     continue
-                hits += 1
-                lines = text.splitlines()
-                title = lines[0][len("# Agent Note: "):] if lines and lines[0].startswith("# Agent Note: ") else md.name
-                state = {"implemented": "locks", "archived": "history",
-                         "proposed": "proposed", "rejected": "rejected"}.get(top.name, top.name)
-                print(md.relative_to(notes).as_posix())
-                print(f"    title:  {title}")
-                print(f"    state:  {state}")
-                print(f"    covers: {', '.join(matched)}")
-                print()
-    print(f"{hits} note(s) cite {len(wanted)} queried path(s)")
+                title, decision = _note_summary(text, md.name)
+                hits.append({"rel": md.relative_to(notes).as_posix(), "name": md.name,
+                             "lifecycle": top.name, "title": title,
+                             "decision": decision, "matched": matched})
+    # Filenames start with yyyy-mm-dd, so the basename orders by date.
+    hits.sort(key=lambda h: h["name"], reverse=True)
+    return hits
+
+
+def covered_notes(notes, paths, limit=10, include_archived=False):
+    """Print the notes citing each PATH, newest first, one compact entry each.
+
+    Archived notes are history, not current locks, so they are counted but not
+    listed unless asked for. The listing is capped so a hot file with hundreds
+    of notes still yields something an agent will actually read.
+    """
+    for raw in paths:
+        if _norm_repo_path(raw) is None:
+            print(f"{raw}: not a repo-relative path, skipped")
+    hits = notes_citing(notes, paths, include_archived=True)
+    archived = [h for h in hits if h["lifecycle"] == "archived"]
+    shown = hits if include_archived else [h for h in hits if h["lifecycle"] != "archived"]
+    label = {"implemented": "locks", "archived": "history",
+             "proposed": "proposed", "rejected": "rejected"}
+    listed = shown if limit <= 0 else shown[:limit]
+    for h in listed:
+        print(f"[{label.get(h['lifecycle'], h['lifecycle'])}] {h['rel']}: {h['title']}")
+        if h["decision"]:
+            print(f"    {h['decision']}")
+    rest = len(shown) - len(listed)
+    if rest:
+        print(f"... and {rest} more; narrow with --find REGEX, or pass --limit 0")
+    if archived and not include_archived:
+        print(f"({len(archived)} archived note(s) also cite these paths; --include-archived lists them)")
+    print(f"{len(shown)} note(s) cite {len(paths)} queried path(s)")
     return 0
 
 
@@ -1084,7 +1132,19 @@ def main(argv=None):
         metavar="PATH",
         nargs="+",
         help="print the notes citing PATH (a file under the cited path, or "
-             "the cited path itself) and exit without verifying",
+             "the cited path itself), newest first, and exit without verifying",
+    )
+    ap.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        metavar="N",
+        help="with --for-path: list at most N notes (default 10, 0 = all)",
+    )
+    ap.add_argument(
+        "--include-archived",
+        action="store_true",
+        help="with --for-path: also list archived notes (history, not current locks)",
     )
     ap.add_argument(
         "--dump-anchors",
@@ -1166,7 +1226,8 @@ def main(argv=None):
         return find_notes(notes, args.find)
 
     if args.for_path:
-        return covered_notes(notes, args.for_path)
+        return covered_notes(notes, args.for_path, limit=args.limit,
+                             include_archived=args.include_archived)
 
     if args.dump_anchors:
         return dump_anchors(notes)
@@ -1275,7 +1336,7 @@ def main(argv=None):
                 if rel not in manifest:
                     manifest[rel] = digest
                     sealed.append(("sealed", rel))
-                elif args.reseal and manifest[rel] != digest:
+                elif args.reseal and not is_retired(manifest[rel]) and manifest[rel] != digest:
                     manifest[rel] = digest
                     sealed.append(("resealed", rel))
             if sealed:
@@ -1285,10 +1346,15 @@ def main(argv=None):
                     print(f"{action} {rel}")
         live = {rel for _, rel in archived}
         for rel in sorted(set(manifest) - live):
-            errors.append(f"{notes}/{rel}: sealed archived note is missing")
+            if not is_retired(manifest[rel]):
+                errors.append(f"{notes}/{rel}: sealed archived note is missing "
+                              f"(retire it deliberately with `new-note.py --retire`)")
         for md, rel in archived:
             if rel not in manifest:
                 errors.append(f"{notes}/{rel}: archived note is not sealed (run with --seal)")
+            elif is_retired(manifest[rel]):
+                errors.append(f"{notes}/{rel}: note was retired on "
+                              f"{manifest[rel]['retired']} and has reappeared")
             elif manifest[rel] != note_digest(md):
                 errors.append(f"{notes}/{rel}: archived note was modified after sealing")
 
